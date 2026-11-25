@@ -2,7 +2,7 @@
 
 # EnPreNiNet: Night Vision Multi-Object Detection
 
-[![Status](https://img.shields.io/badge/Status-Initial_Setup_(v0.1.0)-blue.svg)]()
+[![Status](https://img.shields.io/badge/Status-Pipeline_Ready_(v1.0.0)-brightgreen.svg)]()
 [![Paper](https://img.shields.io/badge/Paper-Discover_AI_2026-green.svg)](https://doi.org/10.1007/s44163-026-02028-y)
 [![Dataset](https://img.shields.io/badge/Dataset-BDD100K_(Night)-orange.svg)](https://bdd-data.berkeley.edu/)
 [![Platform](https://img.shields.io/badge/Platform-Google_Colab-F9AB00.svg?logo=googlecolab&logoColor=white)]()
@@ -22,7 +22,7 @@ Trong điều kiện ánh sáng yếu hoặc ban đêm, các mô hình thị gi�
 
 Repository này được xây dựng nhằm mô phỏng lại phương pháp đề xuất trong bài báo *"Improved multi object detection in night vision environment for autonomous vehicle using EnPreNiNet model"* (Ranjitha & Atham, 2026). Hệ thống kết hợp kỹ thuật cân bằng tương phản cục bộ (**GHE Ensemble**) cùng cơ chế hợp nhất quyết định từ hai kiến trúc phát hiện vật thể (**Enhanced Faster R-CNN** và **Enhanced YOLOv5**).
 
-> **Note:** Dự án hiện đang ở giai đoạn khởi tạo (`v0.1.0 - Initial Setup`), mới thiết lập tài liệu đặc tả kỹ thuật và chưa bao gồm mã nguồn huấn luyện/suy luận.
+> **Note:** Toàn bộ pipeline `F01–F08` (`src/01_prepare_bdd.py` đến `src/06_evaluate.py`, bộ kiểm thử bất biến `tests/test_invariants.py`, và `notebooks/Colab_Runner.ipynb`) đã hoàn thiện và được kiểm chứng offline trên CPU; sẵn sàng chạy huấn luyện/đánh giá đầy đủ E0–E5 trên Google Colab GPU.
 
 ---
 
@@ -89,6 +89,29 @@ Các chỉ số đánh giá được sử dụng trong nghiên cứu bao gồm *
 | Baseline YOLOv5 (Ảnh gốc chưa tiền xử lý) | 20,000 | 79,413 | 33.4% |
 | GHE-YOLOv5 (YOLOv5 + GHE Ensemble) | 25,000 | 90,126 | 65.3% |
 | **EnPreNiNet (Proposed Ensemble Model)** | **27,000** | **105,030** | **76.3%** |
+
+---
+
+## Implementation Roadmap (F01–F08) & Experiment Matrix (E0–E5)
+
+| Feature | Module | Mô tả |
+| :--- | :--- | :--- |
+| **F01** | `configs/config.yaml`, `requirements.txt`, `tests/test_invariants.py` | Khởi tạo cấu hình trung tâm và bộ kiểm thử bất biến |
+| **F02** | `src/01_prepare_bdd.py` | Lọc ảnh ban đêm BDD100K (3 lớp), chia 70/20/10, xuất YOLO `.txt` & COCO `.json` |
+| **F03** | `src/02_ghe_ensemble.py` | Tiền xử lý GHE Ensemble 15 bước (3 chế độ: `fig4_literal`, `fig4_normalized`, `standard_local_he`) |
+| **F04** | `src/03_train_infer_yolo.py` | Huấn luyện & suy luận YOLOv5l theo schema dự đoán thống nhất (`xyxy`, nhãn `0..2`) |
+| **F05** | `src/04_train_infer_frcnn.py` | Huấn luyện & suy luận Faster R-CNN (`resnet_fpn_backbone("resnet152")`), map nhãn `1..3 -> 0..2` |
+| **F06** | `src/05_fusion.py` | Hợp nhất mức điểm số EnPreNiNet (intra-NMS, ngưỡng tin cậy, bật/tắt global NMS) |
+| **F07** | `src/06_evaluate.py` | Đánh giá Precision, Recall, F1, AP@50/mAP@50, AP@75/mAP@75 và báo cáo ablation |
+| **F08** | `notebooks/Colab_Runner.ipynb` | Notebook điều phối mỏng chạy ma trận thực nghiệm **E0–E5** trên Google Colab & lưu Google Drive |
+
+**Ma trận thực nghiệm (E0–E5):**
+- **E0:** Baseline YOLOv5l trên ảnh ban đêm gốc (chưa GHE).
+- **E1:** GHE-YOLOv5l (so sánh các chế độ GHE Ensemble).
+- **E2:** Baseline Faster R-CNN ResNet-152 trên ảnh ban đêm gốc.
+- **E3:** GHE-Faster R-CNN ResNet-152.
+- **E4:** EnPreNiNet Fusion (không dùng Global NMS — ablation `global_nms_enabled: false`).
+- **E5:** **EnPreNiNet Full** (GHE Ensemble + YOLOv5l + Faster R-CNN ResNet-152 + Global NMS tại `tau in {0.25, 0.50, 0.75}`).
 
 ---
 

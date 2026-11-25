@@ -1,0 +1,24 @@
+# Virtual environments
+.venv/
+venv/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Data, weights, outputs & external repos
+data/
+weights/
+runs/
+artifacts/
+yolov5/
+
+# AI Agent harness & documentation (chỉ giữ lại README.md)
+*.md
+!README.md
+feature_list.json
+docs/
+.agent/
+*.pdf

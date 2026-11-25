@@ -1,0 +1,431 @@
+"""F07: Evaluation & Ablation Benchmark Module.
+
+Computes Precision, Recall, F1-Score (per-class, micro, macro) across
+confidence thresholds [0.25, 0.50, 0.75] and AP@50/mAP@50, AP@75/mAP@75
+(all-point PR interpolation) across evaluation IoU thresholds [0.50, 0.75].
+
+Exports a detailed JSON metrics report and a Markdown ablation comparison table
+to artifacts/.
+
+Usage:
+    python src/06_evaluate.py --config configs/config.yaml --dummy --device cpu
+    python src/06_evaluate.py --config configs/config.yaml --preds E0=runs/yolo_raw/yolo_raw_test_preds.pt E5=runs/fusion_standard_local_he/fusion_standard_local_he_test_preds.pt
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+import yaml
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+VALID_IMAGE_VARIANTS = ("raw", "fig4_literal", "fig4_normalized", "standard_local_he")
+
+
+def load_config(config_path: Path) -> dict[str, Any]:
+    with config_path.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def resolve_path(path_str: str) -> Path:
+    p = Path(path_str)
+    return p if p.is_absolute() else (REPO_ROOT / p)
+
+
+def compute_iou_matrix(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+    """Compute pairwise IoU matrix of shape (M, K) for xyxy boxes1 (M, 4) and boxes2 (K, 4)."""
+    b1 = torch.as_tensor(boxes1, dtype=torch.float32)
+    b2 = torch.as_tensor(boxes2, dtype=torch.float32)
+    m = b1.shape[0] if b1.ndim == 2 else 0
+    k = b2.shape[0] if b2.ndim == 2 else 0
+    if m == 0 or k == 0:
+        return torch.zeros((m, k), dtype=torch.float32)
+
+    lt = torch.maximum(b1[:, None, :2], b2[None, :, :2])  # (M, K, 2)
+    rb = torch.minimum(b1[:, None, 2:], b2[None, :, 2:])  # (M, K, 2)
+    wh = (rb - lt).clamp(min=0.0)
+    inter = wh[:, :, 0] * wh[:, :, 1]
+
+    area1 = (b1[:, 2] - b1[:, 0]).clamp(min=0.0) * (b1[:, 3] - b1[:, 1]).clamp(min=0.0)
+    area2 = (b2[:, 2] - b2[:, 0]).clamp(min=0.0) * (b2[:, 3] - b2[:, 1]).clamp(min=0.0)
+    union = area1[:, None] + area2[None, :] - inter
+    return torch.where(union > 0.0, inter / union, torch.zeros_like(inter))
+
+
+def _compute_ap_all_point(recalls: np.ndarray, precisions: np.ndarray) -> float:
+    """Compute Average Precision using all-point Precision-Recall interpolation."""
+    if recalls.size == 0:
+        return 0.0
+    mrec = np.concatenate(([0.0], recalls, [1.0]))
+    mpre = np.concatenate(([0.0], precisions, [0.0]))
+    for idx in range(mpre.size - 1, 0, -1):
+        if mpre[idx - 1] < mpre[idx]:
+            mpre[idx - 1] = mpre[idx]
+    change_idx = np.where(mrec[1:] != mrec[:-1])[0]
+    ap = float(np.sum((mrec[change_idx + 1] - mrec[change_idx]) * mpre[change_idx + 1]))
+    return max(0.0, min(1.0, ap))
+
+
+def _match_class_detections(
+    preds_by_image: dict[int, dict[str, torch.Tensor]],
+    gt_by_image: dict[int, dict[str, torch.Tensor]],
+    class_id: int,
+    iou_threshold: float,
+    conf_threshold: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Greedy 1-to-1 matching for a single class at given IoU and confidence thresholds."""
+    all_image_ids = sorted(set(gt_by_image.keys()) | set(preds_by_image.keys()))
+
+    gt_boxes_map: dict[int, torch.Tensor] = {}
+    gt_matched_map: dict[int, list[bool]] = {}
+    total_gt = 0
+    for img_id in all_image_ids:
+        gt = gt_by_image.get(img_id)
+        if gt is not None and gt["boxes"].numel() > 0:
+            mask = gt["labels"].to(torch.long) == class_id
+            cls_boxes = gt["boxes"][mask].detach().cpu().to(torch.float32)
+        else:
+            cls_boxes = torch.empty((0, 4), dtype=torch.float32)
+        gt_boxes_map[img_id] = cls_boxes
+        gt_matched_map[img_id] = [False] * int(cls_boxes.shape[0])
+        total_gt += int(cls_boxes.shape[0])
+
+    # Gather all class predictions across images and sort globally by score descending
+    det_records: list[tuple[float, int, torch.Tensor]] = []
+    for img_id in all_image_ids:
+        pred = preds_by_image.get(img_id)
+        if pred is None or pred["boxes"].numel() == 0:
+            continue
+        boxes = pred["boxes"].detach().cpu().to(torch.float32)
+        scores = pred["scores"].detach().cpu().to(torch.float32)
+        labels = pred["labels"].detach().cpu().to(torch.long)
+        mask = (labels == class_id) & (scores >= float(conf_threshold))
+        if not bool(mask.any()):
+            continue
+        for b, s in zip(boxes[mask], scores[mask]):
+            det_records.append((float(s.item()), img_id, b))
+
+    det_records.sort(key=lambda item: item[0], reverse=True)
+
+    tp = np.zeros(len(det_records), dtype=np.float64)
+    fp = np.zeros(len(det_records), dtype=np.float64)
+
+    for idx, (_score, img_id, pred_box) in enumerate(det_records):
+        gt_boxes = gt_boxes_map[img_id]
+        if gt_boxes.shape[0] == 0:
+            fp[idx] = 1.0
+            continue
+        ious = compute_iou_matrix(pred_box.unsqueeze(0), gt_boxes)[0]
+        best_iou_val, best_gt_idx_t = ious.max(dim=0)
+        best_iou = float(best_iou_val.item())
+        best_gt_idx = int(best_gt_idx_t.item())
+        if best_iou >= float(iou_threshold) and not gt_matched_map[img_id][best_gt_idx]:
+            gt_matched_map[img_id][best_gt_idx] = True
+            tp[idx] = 1.0
+        else:
+            fp[idx] = 1.0
+
+    return tp, fp, total_gt
+
+
+def _safe_prf(tp_count: float, fp_count: float, fn_count: float) -> tuple[float, float, float]:
+    precision = float(tp_count / (tp_count + fp_count)) if (tp_count + fp_count) > 0.0 else 0.0
+    recall = float(tp_count / (tp_count + fn_count)) if (tp_count + fn_count) > 0.0 else 0.0
+    f1 = float(2.0 * precision * recall / (precision + recall)) if (precision + recall) > 0.0 else 0.0
+    return precision, recall, f1
+
+
+def evaluate_predictions(
+    preds_by_image: dict[int, dict[str, torch.Tensor]],
+    gt_by_image: dict[int, dict[str, torch.Tensor]],
+    class_names: dict[int, str],
+    iou_thresholds: list[float] | tuple[float, ...] = (0.50, 0.75),
+    conf_thresholds: list[float] | tuple[float, ...] = (0.25, 0.50, 0.75),
+) -> dict[str, Any]:
+    """Evaluate unified predictions against ground truth across IoU and confidence thresholds.
+
+    Pure computation function (no file I/O). Safely handles empty predictions and
+    classes with 0 GT instances (excluded from mAP average rather than producing NaN).
+    """
+    sorted_classes = sorted((int(cid), str(cname)) for cid, cname in class_names.items())
+    ap_by_iou: dict[str, Any] = {}
+    operating_points: dict[str, Any] = {}
+
+    for iou_thr in iou_thresholds:
+        iou_key = f"{float(iou_thr):.2f}"
+        per_class_ap: dict[str, float | None] = {}
+        valid_aps: list[float] = []
+
+        for cid, cname in sorted_classes:
+            tp, fp, total_gt = _match_class_detections(
+                preds_by_image=preds_by_image,
+                gt_by_image=gt_by_image,
+                class_id=cid,
+                iou_threshold=float(iou_thr),
+                conf_threshold=0.0,
+            )
+            if total_gt == 0:
+                per_class_ap[cname] = None
+                continue
+            cum_tp = np.cumsum(tp)
+            cum_fp = np.cumsum(fp)
+            recalls = cum_tp / float(total_gt)
+            precisions = np.divide(cum_tp, cum_tp + cum_fp, out=np.zeros_like(cum_tp), where=(cum_tp + cum_fp) > 0)
+            ap_val = _compute_ap_all_point(recalls, precisions)
+            per_class_ap[cname] = ap_val
+            valid_aps.append(ap_val)
+
+        map_val = float(np.mean(valid_aps)) if valid_aps else 0.0
+        ap_by_iou[iou_key] = {"map": map_val, "per_class": per_class_ap}
+
+        # Precision, Recall, F1 at each confidence threshold
+        op_for_iou: dict[str, Any] = {}
+        for conf_thr in conf_thresholds:
+            conf_key = f"{float(conf_thr):.2f}"
+            per_class_prf: dict[str, dict[str, float | int]] = {}
+            micro_tp = 0.0
+            micro_fp = 0.0
+            micro_fn = 0.0
+            macro_ps: list[float] = []
+            macro_rs: list[float] = []
+            macro_f1s: list[float] = []
+
+            for cid, cname in sorted_classes:
+                tp_arr, fp_arr, total_gt = _match_class_detections(
+                    preds_by_image=preds_by_image,
+                    gt_by_image=gt_by_image,
+                    class_id=cid,
+                    iou_threshold=float(iou_thr),
+                    conf_threshold=float(conf_thr),
+                )
+                tp_sum = float(tp_arr.sum())
+                fp_sum = float(fp_arr.sum())
+                fn_sum = float(total_gt) - tp_sum
+                p, r, f1 = _safe_prf(tp_sum, fp_sum, fn_sum)
+
+                per_class_prf[cname] = {
+                    "tp": int(tp_sum),
+                    "fp": int(fp_sum),
+                    "fn": int(fn_sum),
+                    "gt": int(total_gt),
+                    "precision": p,
+                    "recall": r,
+                    "f1": f1,
+                }
+                micro_tp += tp_sum
+                micro_fp += fp_sum
+                micro_fn += fn_sum
+                if total_gt > 0:
+                    macro_ps.append(p)
+                    macro_rs.append(r)
+                    macro_f1s.append(f1)
+
+            micro_p, micro_r, micro_f1 = _safe_prf(micro_tp, micro_fp, micro_fn)
+            macro_p = float(np.mean(macro_ps)) if macro_ps else 0.0
+            macro_r = float(np.mean(macro_rs)) if macro_rs else 0.0
+            macro_f1 = float(np.mean(macro_f1s)) if macro_f1s else 0.0
+
+            op_for_iou[conf_key] = {
+                "micro": {
+                    "tp": int(micro_tp),
+                    "fp": int(micro_fp),
+                    "fn": int(micro_fn),
+                    "precision": micro_p,
+                    "recall": micro_r,
+                    "f1": micro_f1,
+                },
+                "macro": {
+                    "precision": macro_p,
+                    "recall": macro_r,
+                    "f1": macro_f1,
+                },
+                "per_class": per_class_prf,
+            }
+        operating_points[iou_key] = op_for_iou
+
+    # Top-level summary metrics (default operating point: IoU=0.50, conf=first threshold e.g. 0.25)
+    primary_iou = "0.50" if "0.50" in operating_points else next(iter(operating_points.keys()))
+    primary_conf = "0.25" if "0.25" in operating_points[primary_iou] else next(iter(operating_points[primary_iou].keys()))
+    primary_micro = operating_points[primary_iou][primary_conf]["micro"]
+
+    return {
+        "precision": float(primary_micro["precision"]),
+        "recall": float(primary_micro["recall"]),
+        "f1": float(primary_micro["f1"]),
+        "map50": float(ap_by_iou["0.50"]["map"]) if "0.50" in ap_by_iou else 0.0,
+        "map75": float(ap_by_iou["0.75"]["map"]) if "0.75" in ap_by_iou else 0.0,
+        "ap_by_iou": ap_by_iou,
+        "operating_points": operating_points,
+    }
+
+
+def load_coco_ground_truth(coco_json_path: Path) -> dict[int, dict[str, torch.Tensor]]:
+    """Load COCO instances_*.json into {image_id: {'boxes': xyxy, 'labels': 0..2}}."""
+    if not coco_json_path.is_file():
+        raise FileNotFoundError(f"Ground truth COCO JSON not found: {coco_json_path}")
+    data = json.loads(coco_json_path.read_text(encoding="utf-8"))
+
+    boxes_by_img: dict[int, list[list[float]]] = {int(img["id"]): [] for img in data.get("images", [])}
+    labels_by_img: dict[int, list[int]] = {int(img["id"]): [] for img in data.get("images", [])}
+
+    for ann in data.get("annotations", []):
+        img_id = int(ann["image_id"])
+        if img_id not in boxes_by_img:
+            continue
+        x, y, w, h = (float(v) for v in ann["bbox"])
+        if w <= 0.0 or h <= 0.0:
+            continue
+        boxes_by_img[img_id].append([x, y, x + w, y + h])
+        labels_by_img[img_id].append(int(ann["category_id"]))
+
+    gt_by_image: dict[int, dict[str, torch.Tensor]] = {}
+    for img_id in sorted(boxes_by_img.keys()):
+        if boxes_by_img[img_id]:
+            gt_by_image[img_id] = {
+                "boxes": torch.tensor(boxes_by_img[img_id], dtype=torch.float32),
+                "labels": torch.tensor(labels_by_img[img_id], dtype=torch.long),
+            }
+        else:
+            gt_by_image[img_id] = {
+                "boxes": torch.empty((0, 4), dtype=torch.float32),
+                "labels": torch.empty((0,), dtype=torch.long),
+            }
+    return gt_by_image
+
+
+def format_ablation_markdown(report: dict[str, Any]) -> str:
+    """Format model evaluation results into a clean Markdown comparison table."""
+    lines = [
+        f"# EnPreNiNet Evaluation & Ablation Summary ({report['mode']} | split={report['eval_split']})",
+        "",
+        "| Model | mAP@50 | mAP@75 | Precision@0.25 | Recall@0.25 | F1@0.25 | F1@0.50 | F1@0.75 |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+    ]
+    for model_name, metrics in report["models"].items():
+        op50 = metrics["operating_points"].get("0.50", {})
+        f1_25 = op50.get("0.25", {}).get("micro", {}).get("f1", 0.0)
+        f1_50 = op50.get("0.50", {}).get("micro", {}).get("f1", 0.0)
+        f1_75 = op50.get("0.75", {}).get("micro", {}).get("f1", 0.0)
+        lines.append(
+            f"| `{model_name}` | {metrics['map50']:.4f} | {metrics['map75']:.4f} | "
+            f"{metrics['precision']:.4f} | {metrics['recall']:.4f} | "
+            f"{f1_25:.4f} | {f1_50:.4f} | {f1_75:.4f} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def parse_pred_specs(pred_args: list[str] | None, cfg: dict[str, Any], image_variant: str, eval_split: str, dummy: bool) -> dict[str, Path]:
+    """Parse --preds name=path entries or auto-discover default yolo/frcnn/fusion prediction files."""
+    if pred_args:
+        parsed: dict[str, Path] = {}
+        for item in pred_args:
+            if "=" not in item:
+                raise ValueError(f"Expected --preds entry in 'name=path' format, got {item!r}")
+            name, raw_path = item.split("=", 1)
+            parsed[name.strip()] = resolve_path(raw_path.strip())
+        return parsed
+
+    runs_dir = resolve_path(cfg["paths"]["runs_dir"])
+    prefix = "dummy_" if dummy else ""
+    defaults = {
+        "yolo": runs_dir / f"{prefix}yolo_{image_variant}" / f"yolo_{image_variant}_{eval_split}_preds.pt",
+        "frcnn": runs_dir / f"{prefix}frcnn_{image_variant}" / f"frcnn_{image_variant}_{eval_split}_preds.pt",
+        "fusion": runs_dir / f"{prefix}fusion_{image_variant}" / f"fusion_{image_variant}_{eval_split}_preds.pt",
+    }
+    return defaults
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate EnPreNiNet detectors and fusion outputs.")
+    parser.add_argument("--config", type=Path, default=Path("configs/config.yaml"), help="Path to config.yaml")
+    parser.add_argument(
+        "--preds",
+        nargs="+",
+        default=None,
+        help="List of name=path/to/preds.pt entries to evaluate (defaults to yolo, frcnn, fusion)",
+    )
+    parser.add_argument(
+        "--image-variant",
+        type=str,
+        choices=VALID_IMAGE_VARIANTS,
+        default=None,
+        help="Image variant used for default prediction discovery",
+    )
+    parser.add_argument("--gt-coco", type=Path, default=None, help="Override COCO ground-truth JSON path")
+    parser.add_argument("--eval-split", type=str, choices=("val", "test"), default="test", help="Evaluation split")
+    parser.add_argument("--output-dir", type=Path, default=None, help="Override artifacts output directory")
+    parser.add_argument("--device", type=str, default=None, help="Device flag (evaluation runs on CPU tensors)")
+    parser.add_argument("--dummy", action="store_true", help="Evaluate dummy runs against data/dummy_processed GT")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    config_path = args.config if args.config.is_absolute() else (REPO_ROOT / args.config)
+    cfg = load_config(config_path)
+
+    image_variant = args.image_variant or str(cfg["preprocessing"]["ghe_ensemble"]["method"])
+    data_root = resolve_path(cfg["paths"]["data_dummy_processed"] if args.dummy else cfg["paths"]["data_processed"])
+    gt_coco_path = args.gt_coco or (data_root / cfg["paths"]["coco_subdir"] / f"instances_{args.eval_split}.json")
+    output_dir = args.output_dir or resolve_path(cfg["paths"]["artifacts_dir"])
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    gt_by_image = load_coco_ground_truth(gt_coco_path)
+    class_names = {int(k): str(v) for k, v in cfg["dataset"]["classes"].items()}
+    iou_thresholds = [float(t) for t in cfg["evaluation"]["iou_thresholds"]]
+    conf_thresholds = [float(t) for t in cfg["fusion"]["confidence_thresholds"]]
+
+    pred_specs = parse_pred_specs(
+        pred_args=args.preds,
+        cfg=cfg,
+        image_variant=image_variant,
+        eval_split=args.eval_split,
+        dummy=args.dummy,
+    )
+
+    models_report: dict[str, Any] = {}
+    for model_name, pred_path in pred_specs.items():
+        if not pred_path.is_file():
+            raise FileNotFoundError(f"Prediction file for '{model_name}' not found: {pred_path}")
+        preds_by_image = torch.load(pred_path, weights_only=True)
+        models_report[model_name] = evaluate_predictions(
+            preds_by_image=preds_by_image,
+            gt_by_image=gt_by_image,
+            class_names=class_names,
+            iou_thresholds=iou_thresholds,
+            conf_thresholds=conf_thresholds,
+        )
+
+    report = {
+        "mode": "dummy" if args.dummy else "real",
+        "eval_split": args.eval_split,
+        "image_variant": image_variant,
+        "gt_coco": str(gt_coco_path),
+        "iou_thresholds": iou_thresholds,
+        "conf_thresholds": conf_thresholds,
+        "models": models_report,
+    }
+
+    prefix = "dummy_" if args.dummy else ""
+    json_path = output_dir / f"{prefix}metrics_report.json"
+    md_path = output_dir / f"{prefix}ablation_table.md"
+
+    json_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    md_path.write_text(format_ablation_markdown(report), encoding="utf-8")
+
+    compact = {
+        name: {k: round(float(m[k]), 4) for k in ("precision", "recall", "f1", "map50", "map75")}
+        for name, m in models_report.items()
+    }
+    print(f"[06_evaluate] Completed -> {json_path} & {md_path}")
+    print(json.dumps(compact, indent=2))
+
+
+if __name__ == "__main__":
+    main()
