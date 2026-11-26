@@ -6,7 +6,8 @@ frames (labels is None, skipped by default) from valid negative samples
 {car: 0, person: 1, traffic light: 2}, deterministically sorts & splits 70/20/10,
 cleans stale output directories before writing, resizes images to 640x640 into
 images/raw/{train,val,test}/, and exports split manifests, dataset_meta.json
-(with SHA-256 dataset_fingerprint), YOLO .txt labels, and COCO instances_*.json.
+(with SHA-256 dataset_fingerprint hashing manifests + class mapping + annotations),
+YOLO .txt labels, and COCO instances_*.json.
 
 Usage:
     python src/01_prepare_bdd.py --config configs/config.yaml --dummy
@@ -50,26 +51,29 @@ def compute_dataset_fingerprint(
     manifest_by_split: dict[str, list[str]],
     seed: int,
     img_size: int,
+    class_mapping: dict[str, int] | None = None,
+    annotations_by_split: dict[str, list[dict[str, Any]]] | None = None,
 ) -> str:
-    """Compute a deterministic SHA-256 fingerprint from split manifests, seed, and img_size."""
+    """Compute a deterministic SHA-256 fingerprint over manifests, class mapping, and annotations."""
     hasher = hashlib.sha256()
     hasher.update(f"seed={seed}|img_size={img_size}\n".encode("utf-8"))
+    if class_mapping is not None:
+        cm_str = json.dumps(sorted((str(k), int(v)) for k, v in class_mapping.items()))
+        hasher.update(f"class_mapping={cm_str}\n".encode("utf-8"))
     for split_name in ("train", "val", "test"):
         hasher.update(f"[{split_name}]\n".encode("utf-8"))
         for entry in manifest_by_split.get(split_name, []):
-            hasher.update(f"{entry}\n".encode("utf-8"))
+            hasher.update(f"img:{entry}\n".encode("utf-8"))
+        if annotations_by_split is not None:
+            for ann in annotations_by_split.get(split_name, []):
+                hasher.update(
+                    f"ann:{ann['image_id']}:{ann['category_id']}:{ann['bbox']}\n".encode("utf-8")
+                )
     return hasher.hexdigest()
 
 
 def generate_dummy_bdd_dataset(dummy_dir: Path, seed: int = 42) -> Path:
-    """Create a 13-frame BDD100K-schema dummy dataset under data/dummy/.
-
-    Includes:
-    - 8 positive night frames (1280x720) with target box2d + poly2d + out-of-scope classes.
-    - 2 valid negative night frames: night_08.jpg (labels=[]) and night_09.jpg (only out-of-scope/poly2d).
-    - 1 unannotated night frame: night_unannotated_10.jpg (labels=None, skipped by default).
-    - 2 daytime frames (day_00.jpg, day_01.jpg, filtered out).
-    """
+    """Create a 13-frame BDD100K-schema dummy dataset under data/dummy/."""
     images_dir = dummy_dir / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
     labels_path = dummy_dir / "labels_dummy.json"
@@ -147,7 +151,6 @@ def generate_dummy_bdd_dataset(dummy_dir: Path, seed: int = 42) -> Path:
             }
         )
 
-    # Night frame 8: explicitly annotated as empty list [] (valid negative sample)
     _make_image("night_08.jpg", is_night=True)
     frames.append(
         {
@@ -157,7 +160,6 @@ def generate_dummy_bdd_dataset(dummy_dir: Path, seed: int = 42) -> Path:
         }
     )
 
-    # Night frame 9: only out-of-scope class + poly2d (valid negative sample with 0 target objects)
     _make_image("night_09.jpg", is_night=True)
     frames.append(
         {
@@ -178,7 +180,6 @@ def generate_dummy_bdd_dataset(dummy_dir: Path, seed: int = 42) -> Path:
         }
     )
 
-    # Unannotated night frame (labels=None): skipped by default unless --include-null-labels
     _make_image("night_unannotated_10.jpg", is_night=True)
     frames.append(
         {
@@ -188,7 +189,6 @@ def generate_dummy_bdd_dataset(dummy_dir: Path, seed: int = 42) -> Path:
         }
     )
 
-    # 2 daytime frames (must be filtered out)
     for idx in range(2):
         name = f"day_{idx:02d}.jpg"
         _make_image(name, is_night=False)
@@ -243,7 +243,6 @@ def split_frames(
         dups = sorted({nm for nm in names if nm in seen or seen.add(nm)})
         raise ValueError(f"Duplicate frame names detected in BDD labels: {dups[:5]}")
 
-    # Sort by frame name before shuffling so split reproducibility is independent of JSON order
     ordered = sorted(frames, key=lambda fr: str(fr["name"]))
     random.Random(seed).shuffle(ordered)
 
@@ -260,7 +259,6 @@ def split_frames(
 
 
 def _clean_output_subdirs(out_dir: Path, subdirs: tuple[Path, ...]) -> None:
-    """Remove stale generated subdirectories before re-preparing dataset splits."""
     for sub in subdirs:
         target = out_dir / sub
         if target.exists():
@@ -304,7 +302,6 @@ def prepare_bdd_dataset(
             continue
         valid_night_frames.append(fr)
 
-    # Deterministic cap for pilot experiments (sort by name before capping)
     if max_images is not None and max_images > 0 and len(valid_night_frames) > max_images:
         valid_night_frames = sorted(valid_night_frames, key=lambda fr: str(fr["name"]))[:max_images]
 
@@ -315,7 +312,6 @@ def prepare_bdd_dataset(
         seed=seed,
     )
 
-    # P0 fix: clean stale files from previous runs before writing fresh split outputs
     out_dir.mkdir(parents=True, exist_ok=True)
     _clean_output_subdirs(out_dir, (images_raw_subdir, splits_subdir, yolo_subdir, coco_subdir))
 
@@ -323,29 +319,17 @@ def prepare_bdd_dataset(
         {"id": cls_id, "name": cls_name, "supercategory": "object"}
         for cls_id, cls_name in sorted(classes_dict.items())
     ]
-
-    # Pre-build manifests & dataset_fingerprint so COCO info embeds the exact fingerprint
     manifest_by_split: dict[str, list[str]] = {
         split_name: [(images_raw_subdir / split_name / fr["name"]).as_posix() for fr in split_map[split_name]]
         for split_name in ("train", "val", "test")
     }
-    dataset_fingerprint = compute_dataset_fingerprint(manifest_by_split, seed=seed, img_size=img_size)
 
     global_image_id = 1
     global_ann_id = 1
-    stats: dict[str, Any] = {
-        "total_input_frames": len(all_frames),
-        "night_frames": len(valid_night_frames),
-        "filtered_out_frames": filtered_out_non_night,
-        "skipped_null_labels": skipped_null_labels,
-        "include_null_labels": include_null_labels,
-        "seed": seed,
-        "img_size": img_size,
-        "dataset_fingerprint": dataset_fingerprint,
-        "splits": {},
-        "negative_samples": 0,
-        "class_counts": {cls_id: 0 for cls_id in sorted(classes_dict.keys())},
-    }
+    coco_images_by_split: dict[str, list[dict[str, Any]]] = {}
+    coco_anns_by_split: dict[str, list[dict[str, Any]]] = {}
+    negative_samples = 0
+    class_counts: dict[int, int] = {cls_id: 0 for cls_id in sorted(classes_dict.keys())}
 
     (out_dir / splits_subdir).mkdir(parents=True, exist_ok=True)
     (out_dir / coco_subdir).mkdir(parents=True, exist_ok=True)
@@ -369,9 +353,7 @@ def prepare_bdd_dataset(
 
             orig_h, orig_w = img.shape[:2]
             resized = cv2.resize(img, (img_size, img_size), interpolation=cv2.INTER_LINEAR)
-
-            dst_img_path = split_img_dir / img_name
-            _write_image_checked(dst_img_path, resized)
+            _write_image_checked(split_img_dir / img_name, resized)
 
             img_id = global_image_id
             global_image_id += 1
@@ -413,7 +395,7 @@ def prepare_bdd_dataset(
                     continue
 
                 cls_id = int(class_mapping[category])
-                stats["class_counts"][cls_id] += 1
+                class_counts[cls_id] += 1
 
                 x1_n = round(x1_s / img_size, 6)
                 y1_n = round(y1_s / img_size, 6)
@@ -440,7 +422,7 @@ def prepare_bdd_dataset(
                 global_ann_id += 1
 
             if not yolo_lines:
-                stats["negative_samples"] += 1
+                negative_samples += 1
 
             yolo_txt_path = split_yolo_dir / f"{Path(img_name).stem}.txt"
             yolo_txt_path.write_text("\n".join(yolo_lines) + ("\n" if yolo_lines else ""), encoding="utf-8")
@@ -449,6 +431,33 @@ def prepare_bdd_dataset(
         manifest_path = out_dir / splits_subdir / f"{split_name}.txt"
         manifest_path.write_text("\n".join(manifest_lines) + ("\n" if manifest_lines else ""), encoding="utf-8")
 
+        coco_images_by_split[split_name] = coco_images
+        coco_anns_by_split[split_name] = coco_annotations
+
+    # A03 fix: include class_mapping and all annotation contents in dataset_fingerprint
+    dataset_fingerprint = compute_dataset_fingerprint(
+        manifest_by_split=manifest_by_split,
+        seed=seed,
+        img_size=img_size,
+        class_mapping=class_mapping,
+        annotations_by_split=coco_anns_by_split,
+    )
+
+    stats: dict[str, Any] = {
+        "total_input_frames": len(all_frames),
+        "night_frames": len(valid_night_frames),
+        "filtered_out_frames": filtered_out_non_night,
+        "skipped_null_labels": skipped_null_labels,
+        "include_null_labels": include_null_labels,
+        "seed": seed,
+        "img_size": img_size,
+        "dataset_fingerprint": dataset_fingerprint,
+        "splits": {},
+        "negative_samples": negative_samples,
+        "class_counts": class_counts,
+    }
+
+    for split_name in ("train", "val", "test"):
         coco_payload = {
             "info": {
                 "description": f"EnPreNiNet BDD100K Night ({split_name})",
@@ -456,21 +465,19 @@ def prepare_bdd_dataset(
                 "dataset_fingerprint": dataset_fingerprint,
                 "seed": seed,
             },
-            "images": coco_images,
-            "annotations": coco_annotations,
+            "images": coco_images_by_split[split_name],
+            "annotations": coco_anns_by_split[split_name],
             "categories": coco_categories,
         }
         coco_path = out_dir / coco_subdir / f"instances_{split_name}.json"
         with coco_path.open("w", encoding="utf-8") as f:
             json.dump(coco_payload, f, indent=2)
-
         stats["splits"][split_name] = {
-            "images": len(coco_images),
-            "annotations": len(coco_annotations),
+            "images": len(coco_images_by_split[split_name]),
+            "annotations": len(coco_anns_by_split[split_name]),
         }
 
-    meta_path = out_dir / "dataset_meta.json"
-    meta_path.write_text(json.dumps(stats, indent=2), encoding="utf-8")
+    (out_dir / "dataset_meta.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
     return stats
 
 
@@ -510,7 +517,6 @@ def main() -> None:
         raw_dir = args.raw_dir or resolve_path(cfg["paths"]["data_dummy"])
         out_dir = args.out_dir or resolve_path(cfg["paths"]["data_dummy_processed"])
         labels_json = args.labels_json or (raw_dir / "labels_dummy.json")
-        # Regenerate dummy dataset to keep schema aligned with latest unannotated-vs-negative fixtures
         generate_dummy_bdd_dataset(raw_dir, seed=seed)
     else:
         raw_dir = args.raw_dir or resolve_path(cfg["paths"]["data_raw"])

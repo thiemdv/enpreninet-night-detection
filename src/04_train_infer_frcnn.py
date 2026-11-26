@@ -5,21 +5,23 @@ Builds a two-stage Faster R-CNN detector using torchvision's
 wrapped in `FasterRCNN(..., num_classes=4, min_size=640, max_size=640)`.
 
 Features:
+  - Isolated outputs via `--run-id` (`runs/<run_id>/frcnn_<variant>/`, `weights/<run_id>/...`).
+  - Strict `ghe_meta.json["dataset_fingerprint"]` verification before training on GHE variants.
   - Strict 640x640 input shape validation (no silent resize mismatching annotations).
-  - Explicit `trainable_layers=5` when `weights=None` so backbone layers are unfrozen.
+  - Explicit `trainable_layers=5` when `weights=None` so backbone stages remain unfrozen.
   - Finite loss check (`torch.isfinite`) + gradient norm clipping.
-  - Validation loss tracking & best-checkpoint persistence in real training mode.
-  - Companion `.meta.json` sidecar storing `dataset_fingerprint` next to predictions.
+  - CPU-offloaded `best_state_dict` + immediate disk save on validation loss improvement.
+  - Note: validation loss uses torchvision's standard `model.train()` under `torch.no_grad()`,
+    which carries minor stochasticity from RPN/ROI proposal sampling.
 
 Usage:
     python src/04_train_infer_frcnn.py --config configs/config.yaml --dummy --epochs 1 --device cpu
-    python src/04_train_infer_frcnn.py --config configs/config.yaml --image-variant standard_local_he --device cuda
+    python src/04_train_infer_frcnn.py --config configs/config.yaml --run-id pilot --image-variant standard_local_he --device cuda
 """
 
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 from pathlib import Path
 from typing import Any
@@ -47,6 +49,23 @@ def resolve_path(path_str: str) -> Path:
     return p if p.is_absolute() else (REPO_ROOT / p)
 
 
+def resolve_frcnn_output_paths(
+    cfg: dict[str, Any],
+    run_id: str,
+    image_variant: str,
+    eval_split: str,
+    dummy: bool = False,
+) -> tuple[Path, Path, Path]:
+    """Return isolated (run_dir, ckpt_path, preds_path) under runs/<run_id>/ and weights/<run_id>/."""
+    run_dir = resolve_path(cfg["paths"]["runs_dir"]) / run_id / f"frcnn_{image_variant}"
+    preds_path = run_dir / f"frcnn_{image_variant}_{eval_split}_preds.pt"
+    if dummy:
+        ckpt_path = run_dir / f"frcnn_resnet152_dummy_{image_variant}.pth"
+    else:
+        ckpt_path = resolve_path(cfg["paths"]["weights_dir"]) / run_id / f"frcnn_resnet152_{image_variant}.pth"
+    return run_dir, ckpt_path, preds_path
+
+
 def select_device(device_arg: str | None, cfg: dict[str, Any]) -> torch.device:
     req = (device_arg or str(cfg["project"]["device"])).lower()
     if req == "auto":
@@ -64,6 +83,34 @@ def resolve_variant_image(data_root: Path, image_variant: str, split: str, file_
     raise FileNotFoundError(f"Image '{file_name}' not found under {split_dir}")
 
 
+def verify_ghe_metadata(
+    data_root: Path,
+    image_variant: str,
+    expected_dataset_fp: str | None,
+) -> dict[str, Any] | None:
+    """A03 fix: verify GHE images match the current dataset_fingerprint before training/inference."""
+    if image_variant == "raw":
+        return None
+    ghe_meta_path = data_root / "images" / image_variant / "ghe_meta.json"
+    if not ghe_meta_path.is_file():
+        raise FileNotFoundError(
+            f"Missing GHE metadata file: {ghe_meta_path}. Re-run src/02_ghe_ensemble.py for '{image_variant}'."
+        )
+    ghe_meta = json.loads(ghe_meta_path.read_text(encoding="utf-8"))
+    ghe_fp = ghe_meta.get("dataset_fingerprint")
+    if not expected_dataset_fp or not ghe_fp:
+        raise ValueError(
+            f"Missing dataset_fingerprint in COCO ({expected_dataset_fp}) or {ghe_meta_path} ({ghe_fp})."
+        )
+    if str(ghe_fp) != str(expected_dataset_fp):
+        raise ValueError(
+            f"Stale GHE images detected for '{image_variant}': "
+            f"ghe_meta.dataset_fingerprint={ghe_fp} != coco.dataset_fingerprint={expected_dataset_fp}. "
+            f"Re-run src/02_ghe_ensemble.py before training."
+        )
+    return ghe_meta
+
+
 def save_prediction_meta(preds_path: Path, meta: dict[str, Any]) -> Path:
     meta_path = preds_path.with_name(f"{preds_path.name}.meta.json")
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -71,7 +118,6 @@ def save_prediction_meta(preds_path: Path, meta: dict[str, Any]) -> Path:
 
 
 def empty_prediction() -> dict[str, torch.Tensor]:
-    """Return an empty unified prediction entry with exact shapes and dtypes."""
     return {
         "boxes": torch.empty((0, 4), dtype=torch.float32),
         "scores": torch.empty((0,), dtype=torch.float32),
@@ -104,7 +150,7 @@ def encode_frcnn_targets(
             continue
 
         boxes_list.append([x1, y1, x2, y2])
-        labels_list.append(cat_id + 1)  # 0..2 -> 1..3 (0 reserved for background)
+        labels_list.append(cat_id + 1)
         areas_list.append((x2 - x1) * (y2 - y1))
         iscrowd_list.append(int(ann.get("iscrowd", 0)))
 
@@ -158,7 +204,7 @@ def decode_frcnn_predictions(
 
     boxes = boxes[valid_mask]
     scores = scores[valid_mask]
-    labels = labels[valid_mask] - 1  # Map 1..3 -> 0..2
+    labels = labels[valid_mask] - 1
 
     order = torch.argsort(scores, descending=True)
     return {
@@ -177,11 +223,7 @@ def build_faster_rcnn_model(
     nms_iou: float = 0.50,
     trainable_backbone_layers: int | None = None,
 ) -> FasterRCNN:
-    """Build Faster R-CNN with ResNet-152 FPN backbone and fixed 640x640 input scale.
-
-    When pretrained=False (weights=None), defaults trainable_backbone_layers=5 so all
-    backbone stages remain trainable instead of torchvision's default freeze policy.
-    """
+    """Build Faster R-CNN with ResNet-152 FPN backbone and fixed 640x640 input scale."""
     weights = ResNet152_Weights.DEFAULT if (pretrained and backbone_name == "resnet152") else None
     t_layers = trainable_backbone_layers if trainable_backbone_layers is not None else (3 if pretrained else 5)
     backbone = resnet_fpn_backbone(
@@ -263,6 +305,11 @@ def collate_fn(
     return list(images), list(targets)
 
 
+def _cpu_state_dict(model: FasterRCNN) -> dict[str, torch.Tensor]:
+    """A04 fix: copy model weights to CPU so GPU VRAM is not duplicated during training."""
+    return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+
 def _compute_validation_loss(
     model: FasterRCNN,
     val_loader: DataLoader,
@@ -286,6 +333,7 @@ def _compute_validation_loss(
 def train_and_infer_frcnn(
     cfg: dict[str, Any],
     data_root: Path,
+    run_id: str,
     image_variant: str,
     eval_split: str,
     epochs: int,
@@ -294,7 +342,7 @@ def train_and_infer_frcnn(
     score_floor: float,
     dummy: bool,
 ) -> tuple[Path, Path, float, float | None]:
-    """Train Faster R-CNN ResNet-152 with finite-loss check & val checkpointing, then export unified predictions."""
+    """Train Faster R-CNN ResNet-152 with CPU-offloaded immediate best checkpointing, then export predictions."""
     seed = int(cfg["project"]["seed"])
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -322,6 +370,7 @@ def train_and_infer_frcnn(
         img_size=img_size,
         num_target_classes=num_target_classes,
     )
+    ghe_meta = verify_ghe_metadata(data_root, image_variant, eval_ds.dataset_fingerprint)
 
     effective_bs = 1 if dummy else batch_size
     train_loader = DataLoader(train_ds, batch_size=effective_bs, shuffle=not dummy, collate_fn=collate_fn)
@@ -360,9 +409,34 @@ def train_and_infer_frcnn(
         weight_decay=float(frcnn_cfg["weight_decay"]),
     )
 
+    run_dir, ckpt_path, preds_path = resolve_frcnn_output_paths(
+        cfg, run_id=run_id, image_variant=image_variant, eval_split=eval_split, dummy=dummy
+    )
+    run_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _save_checkpoint(state_dict_cpu: dict[str, torch.Tensor], best_vl: float | None, epoch_num: int) -> None:
+        torch.save(
+            {
+                "model_state_dict": state_dict_cpu,
+                "backbone": str(frcnn_cfg["backbone"]),
+                "num_classes": num_classes,
+                "img_size": img_size,
+                "run_id": run_id,
+                "image_variant": image_variant,
+                "trainable_backbone_layers": trainable_layers,
+                "epoch": epoch_num,
+                "best_val_loss": best_vl,
+                "dataset_fingerprint": eval_ds.dataset_fingerprint,
+                "preprocessing_fingerprint": (ghe_meta or {}).get("preprocessing_fingerprint"),
+                "dummy": dummy,
+            },
+            ckpt_path,
+        )
+
     last_loss = 0.0
     best_val_loss: float | None = None
-    best_state_dict: dict[str, torch.Tensor] | None = None
+    best_state_dict_cpu: dict[str, torch.Tensor] | None = None
 
     for epoch_idx in range(max(1, epochs)):
         model.train()
@@ -398,36 +472,14 @@ def train_and_infer_frcnn(
             )
             if best_val_loss is None or val_loss < best_val_loss:
                 best_val_loss = val_loss
-                best_state_dict = copy.deepcopy(model.state_dict())
+                best_state_dict_cpu = _cpu_state_dict(model)
+                # A04 fix: persist best checkpoint immediately to disk/Drive on improvement
+                _save_checkpoint(best_state_dict_cpu, best_val_loss, epoch_idx + 1)
 
-    if best_state_dict is not None:
-        model.load_state_dict(best_state_dict)
-
-    if dummy:
-        run_dir = resolve_path(cfg["paths"]["runs_dir"]) / f"dummy_frcnn_{image_variant}"
-        run_dir.mkdir(parents=True, exist_ok=True)
-        ckpt_path = run_dir / f"frcnn_resnet152_dummy_{image_variant}.pth"
+    if best_state_dict_cpu is not None:
+        model.load_state_dict({k: v.to(device) for k, v in best_state_dict_cpu.items()})
     else:
-        run_dir = resolve_path(cfg["paths"]["runs_dir"]) / f"frcnn_{image_variant}"
-        run_dir.mkdir(parents=True, exist_ok=True)
-        weights_dir = resolve_path(cfg["paths"]["weights_dir"])
-        weights_dir.mkdir(parents=True, exist_ok=True)
-        ckpt_path = weights_dir / f"frcnn_resnet152_{image_variant}.pth"
-
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "backbone": str(frcnn_cfg["backbone"]),
-            "num_classes": num_classes,
-            "img_size": img_size,
-            "image_variant": image_variant,
-            "trainable_backbone_layers": trainable_layers,
-            "best_val_loss": best_val_loss,
-            "dataset_fingerprint": eval_ds.dataset_fingerprint,
-            "dummy": dummy,
-        },
-        ckpt_path,
-    )
+        _save_checkpoint(_cpu_state_dict(model), best_val_loss, max(1, epochs))
 
     model.eval()
     preds_by_image: dict[int, dict[str, torch.Tensor]] = {}
@@ -443,12 +495,12 @@ def train_and_infer_frcnn(
                 num_target_classes=num_target_classes,
             )
 
-    preds_path = run_dir / f"frcnn_{image_variant}_{eval_split}_preds.pt"
     torch.save(preds_by_image, preds_path)
     save_prediction_meta(
         preds_path,
         {
             "model": f"faster_rcnn_{frcnn_cfg['backbone']}",
+            "run_id": run_id,
             "image_variant": image_variant,
             "eval_split": eval_split,
             "score_floor": score_floor,
@@ -457,6 +509,7 @@ def train_and_infer_frcnn(
             "trainable_backbone_layers": trainable_layers,
             "best_val_loss": best_val_loss,
             "dataset_fingerprint": eval_ds.dataset_fingerprint,
+            "preprocessing_fingerprint": (ghe_meta or {}).get("preprocessing_fingerprint"),
             "num_eval_images": len(preds_by_image),
             "dummy": dummy,
         },
@@ -467,6 +520,7 @@ def train_and_infer_frcnn(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train & infer Faster R-CNN ResNet-152 and export unified predictions.")
     parser.add_argument("--config", type=Path, default=Path("configs/config.yaml"), help="Path to config.yaml")
+    parser.add_argument("--run-id", type=str, default=None, help="Run namespace isolating outputs (dummy, pilot, full)")
     parser.add_argument(
         "--image-variant",
         type=str,
@@ -489,6 +543,7 @@ def main() -> None:
     config_path = args.config if args.config.is_absolute() else (REPO_ROOT / args.config)
     cfg = load_config(config_path)
 
+    run_id = args.run_id or ("dummy" if args.dummy else "full")
     image_variant = args.image_variant or str(cfg["preprocessing"]["ghe_ensemble"]["method"])
     epochs = args.epochs if args.epochs is not None else int(cfg["models"]["faster_rcnn"]["epochs"])
     batch_size = args.batch_size if args.batch_size is not None else int(cfg["models"]["faster_rcnn"]["batch_size"])
@@ -499,6 +554,7 @@ def main() -> None:
     ckpt_path, preds_path, last_loss, best_val_loss = train_and_infer_frcnn(
         cfg=cfg,
         data_root=data_root,
+        run_id=run_id,
         image_variant=image_variant,
         eval_split=args.eval_split,
         epochs=epochs,
@@ -511,6 +567,7 @@ def main() -> None:
     preds = torch.load(preds_path, weights_only=True)
     summary = {
         "mode": "dummy" if args.dummy else "real",
+        "run_id": run_id,
         "backbone": cfg["models"]["faster_rcnn"]["backbone"],
         "image_variant": image_variant,
         "eval_split": args.eval_split,

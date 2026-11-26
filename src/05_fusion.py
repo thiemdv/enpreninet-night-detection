@@ -2,15 +2,15 @@
 
 Merges unified predictions from YOLOv5l (Branch 1) and Faster R-CNN ResNet-152
 (Branch 2) using:
-  1. Strict image_id key alignment and sidecar dataset_fingerprint verification.
-  2. Optional intra-model NMS (disabled by default since detectors run native NMS).
-  3. Confidence thresholding (default 0.001 for full PR curve, plus unique stem-based
-     tau snapshots so E4 and E5 never overwrite each other).
-  4. Concatenation + toggleable class-wise Global NMS via `torchvision.ops.batched_nms`.
+  1. Fail-closed sidecar metadata verification (dataset_fingerprint, image_variant,
+     eval_split, preprocessing_fingerprint; opt-in `--allow-legacy-predictions`).
+  2. Strict image_id key alignment across both branches.
+  3. Optional intra-model NMS + confidence thresholding + toggleable class-wise Global NMS.
+  4. Collision-free confidence snapshot filenames + companion `.meta.json` for every `.pt`.
 
 Usage:
     python src/05_fusion.py --config configs/config.yaml --dummy --device cpu
-    python src/05_fusion.py --config configs/config.yaml --yolo-preds ... --frcnn-preds ... --no-global-nms
+    python src/05_fusion.py --config configs/config.yaml --run-id pilot --global-nms --device cuda
 """
 
 from __future__ import annotations
@@ -36,6 +36,20 @@ def load_config(config_path: Path) -> dict[str, Any]:
 def resolve_path(path_str: str) -> Path:
     p = Path(path_str)
     return p if p.is_absolute() else (REPO_ROOT / p)
+
+
+def resolve_fusion_paths(
+    cfg: dict[str, Any],
+    run_id: str,
+    image_variant: str,
+    eval_split: str,
+) -> tuple[Path, Path, Path]:
+    """Return isolated (yolo_path, frcnn_path, fusion_output_path) under runs/<run_id>/."""
+    run_root = resolve_path(cfg["paths"]["runs_dir"]) / run_id
+    yolo_path = run_root / f"yolo_{image_variant}" / f"yolo_{image_variant}_{eval_split}_preds.pt"
+    frcnn_path = run_root / f"frcnn_{image_variant}" / f"frcnn_{image_variant}_{eval_split}_preds.pt"
+    out_path = run_root / f"fusion_{image_variant}" / f"fusion_{image_variant}_{eval_split}_preds.pt"
+    return yolo_path, frcnn_path, out_path
 
 
 def select_device(device_arg: str | None, cfg: dict[str, Any]) -> torch.device:
@@ -65,7 +79,6 @@ def snapshot_path_for_tau(output_path: Path, tau: float) -> Path:
 
 
 def empty_prediction() -> dict[str, torch.Tensor]:
-    """Return an empty unified prediction entry with exact shapes and dtypes."""
     return {
         "boxes": torch.empty((0, 4), dtype=torch.float32),
         "scores": torch.empty((0,), dtype=torch.float32),
@@ -179,23 +192,70 @@ def fuse_prediction_dicts(
     return fused
 
 
-def verify_and_resolve_fingerprint(yolo_path: Path, frcnn_path: Path) -> str | None:
-    """Ensure YOLO and Faster R-CNN sidecar metadata share the same dataset_fingerprint."""
-    yolo_meta = read_prediction_meta(yolo_path) or {}
-    frcnn_meta = read_prediction_meta(frcnn_path) or {}
-    fp_yolo = yolo_meta.get("dataset_fingerprint")
-    fp_frcnn = frcnn_meta.get("dataset_fingerprint")
-    if fp_yolo and fp_frcnn and fp_yolo != fp_frcnn:
+def verify_and_resolve_branch_metadata(
+    yolo_path: Path,
+    frcnn_path: Path,
+    allow_legacy: bool = False,
+) -> dict[str, Any]:
+    """A02 fail-closed check: require matching dataset_fingerprint, image_variant, and eval_split."""
+    yolo_meta = read_prediction_meta(yolo_path)
+    frcnn_meta = read_prediction_meta(frcnn_path)
+
+    if not allow_legacy:
+        if yolo_meta is None or frcnn_meta is None:
+            raise ValueError(
+                f"Missing prediction sidecar metadata (.meta.json) for YOLO ({yolo_path}) or "
+                f"Faster R-CNN ({frcnn_path}). Pass --allow-legacy-predictions to override."
+            )
+
+    ym = yolo_meta or {}
+    fm = frcnn_meta or {}
+    fp_yolo = ym.get("dataset_fingerprint")
+    fp_frcnn = fm.get("dataset_fingerprint")
+
+    if not allow_legacy and (not fp_yolo or not fp_frcnn):
         raise ValueError(
-            f"Dataset fingerprint mismatch between YOLO ({fp_yolo}) and Faster R-CNN ({fp_frcnn}). "
-            f"Re-run both detectors on the same prepared dataset split."
+            f"Missing dataset_fingerprint: yolo={fp_yolo}, frcnn={fp_frcnn}. "
+            f"Pass --allow-legacy-predictions to override."
         )
-    return str(fp_yolo or fp_frcnn) if (fp_yolo or fp_frcnn) else None
+    if fp_yolo and fp_frcnn and str(fp_yolo) != str(fp_frcnn):
+        raise ValueError(
+            f"Dataset fingerprint mismatch between YOLO ({fp_yolo}) and Faster R-CNN ({fp_frcnn})."
+        )
+
+    var_yolo = ym.get("image_variant")
+    var_frcnn = fm.get("image_variant")
+    if var_yolo and var_frcnn and str(var_yolo) != str(var_frcnn):
+        raise ValueError(
+            f"Image variant mismatch between YOLO ({var_yolo}) and Faster R-CNN ({var_frcnn})."
+        )
+
+    split_yolo = ym.get("eval_split")
+    split_frcnn = fm.get("eval_split")
+    if split_yolo and split_frcnn and str(split_yolo) != str(split_frcnn):
+        raise ValueError(
+            f"Eval split mismatch between YOLO ({split_yolo}) and Faster R-CNN ({split_frcnn})."
+        )
+
+    pfp_yolo = ym.get("preprocessing_fingerprint")
+    pfp_frcnn = fm.get("preprocessing_fingerprint")
+    if pfp_yolo and pfp_frcnn and str(pfp_yolo) != str(pfp_frcnn):
+        raise ValueError(
+            f"Preprocessing fingerprint mismatch between YOLO ({pfp_yolo}) and Faster R-CNN ({pfp_frcnn})."
+        )
+
+    return {
+        "dataset_fingerprint": str(fp_yolo) if (fp_yolo and fp_frcnn) else (str(fp_yolo or fp_frcnn) if allow_legacy and (fp_yolo or fp_frcnn) else None),
+        "preprocessing_fingerprint": str(pfp_yolo or pfp_frcnn) if (pfp_yolo or pfp_frcnn) else None,
+        "image_variant": str(var_yolo or var_frcnn) if (var_yolo or var_frcnn) else None,
+        "eval_split": str(split_yolo or split_frcnn) if (split_yolo or split_frcnn) else None,
+    }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="EnPreNiNet Score-Level Fusion (YOLOv5 + Faster R-CNN).")
     parser.add_argument("--config", type=Path, default=Path("configs/config.yaml"), help="Path to config.yaml")
+    parser.add_argument("--run-id", type=str, default=None, help="Run namespace isolating outputs (dummy, pilot, full)")
     parser.add_argument(
         "--image-variant",
         type=str,
@@ -228,7 +288,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--global-nms-iou", type=float, default=None, help="Override fusion.global_nms_iou")
     parser.add_argument("--eval-split", type=str, choices=("val", "test"), default="test", help="Split name")
     parser.add_argument("--device", type=str, default=None, help="Device: cpu, cuda, or auto")
-    parser.add_argument("--dummy", action="store_true", help="Run on isolated dummy predictions under runs/")
+    parser.add_argument(
+        "--allow-legacy-predictions",
+        action="store_true",
+        default=False,
+        help="Allow fusing prediction .pt files lacking .meta.json fingerprints",
+    )
+    parser.add_argument("--dummy", action="store_true", help="Run on isolated runs/dummy/ predictions")
     return parser.parse_args()
 
 
@@ -238,6 +304,7 @@ def main() -> None:
     cfg = load_config(config_path)
 
     fusion_cfg = cfg["fusion"]
+    run_id = args.run_id or ("dummy" if args.dummy else "full")
     image_variant = args.image_variant or str(cfg["preprocessing"]["ghe_ensemble"]["method"])
     global_nms_enabled = (
         bool(args.global_nms) if args.global_nms is not None else bool(fusion_cfg["global_nms_enabled"])
@@ -249,25 +316,24 @@ def main() -> None:
         float(args.global_nms_iou) if args.global_nms_iou is not None else float(fusion_cfg["global_nms_iou"])
     )
     device = select_device(args.device, cfg)
-    runs_dir = resolve_path(cfg["paths"]["runs_dir"])
 
-    prefix = "dummy_" if args.dummy else ""
-    yolo_path = args.yolo_preds or (
-        runs_dir / f"{prefix}yolo_{image_variant}" / f"yolo_{image_variant}_{args.eval_split}_preds.pt"
+    default_yolo, default_frcnn, default_out = resolve_fusion_paths(
+        cfg, run_id=run_id, image_variant=image_variant, eval_split=args.eval_split
     )
-    frcnn_path = args.frcnn_preds or (
-        runs_dir / f"{prefix}frcnn_{image_variant}" / f"frcnn_{image_variant}_{args.eval_split}_preds.pt"
-    )
-    output_path = args.output or (
-        runs_dir / f"{prefix}fusion_{image_variant}" / f"fusion_{image_variant}_{args.eval_split}_preds.pt"
-    )
+    yolo_path = args.yolo_preds or default_yolo
+    frcnn_path = args.frcnn_preds or default_frcnn
+    output_path = args.output or default_out
 
     if not yolo_path.is_file():
         raise FileNotFoundError(f"YOLOv5 predictions not found: {yolo_path}")
     if not frcnn_path.is_file():
         raise FileNotFoundError(f"Faster R-CNN predictions not found: {frcnn_path}")
 
-    dataset_fp = verify_and_resolve_fingerprint(yolo_path, frcnn_path)
+    branch_meta = verify_and_resolve_branch_metadata(
+        yolo_path, frcnn_path, allow_legacy=args.allow_legacy_predictions
+    )
+    dataset_fp = branch_meta["dataset_fingerprint"]
+    preproc_fp = branch_meta["preprocessing_fingerprint"]
 
     yolo_preds = torch.load(yolo_path, weights_only=True)
     frcnn_preds = torch.load(frcnn_path, weights_only=True)
@@ -285,23 +351,22 @@ def main() -> None:
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(fused_preds, output_path)
-    save_prediction_meta(
-        output_path,
-        {
-            "model": "enpreninet_fusion",
-            "image_variant": image_variant,
-            "eval_split": args.eval_split,
-            "global_nms_enabled": global_nms_enabled,
-            "global_nms_iou": global_nms_iou,
-            "apply_intra_nms": args.apply_intra_nms,
-            "conf_thres": args.conf_thres,
-            "dataset_fingerprint": dataset_fp,
-            "num_eval_images": len(fused_preds),
-            "dummy": args.dummy,
-        },
-    )
+    base_meta = {
+        "model": "enpreninet_fusion",
+        "run_id": run_id,
+        "image_variant": image_variant,
+        "eval_split": args.eval_split,
+        "global_nms_enabled": global_nms_enabled,
+        "global_nms_iou": global_nms_iou,
+        "apply_intra_nms": args.apply_intra_nms,
+        "conf_thres": args.conf_thres,
+        "dataset_fingerprint": dataset_fp,
+        "preprocessing_fingerprint": preproc_fp,
+        "num_eval_images": len(fused_preds),
+        "dummy": args.dummy,
+    }
+    save_prediction_meta(output_path, base_meta)
 
-    # P0 fix: snapshot filenames derive from output_path.stem so E4 and E5 never overwrite each other
     tau_counts: dict[str, int] = {}
     for tau in fusion_cfg["confidence_thresholds"]:
         tau_val = float(tau)
@@ -317,10 +382,13 @@ def main() -> None:
         )
         tau_path = snapshot_path_for_tau(output_path, tau_val)
         torch.save(tau_preds, tau_path)
+        # A08 fix: emit companion .meta.json for every confidence snapshot too
+        save_prediction_meta(tau_path, {**base_meta, "conf_thres": tau_val, "snapshot": True})
         tau_counts[f"tau_{tau_val:.2f}"] = sum(int(v["boxes"].shape[0]) for v in tau_preds.values())
 
     summary = {
         "mode": "dummy" if args.dummy else "real",
+        "run_id": run_id,
         "image_variant": image_variant,
         "eval_split": args.eval_split,
         "global_nms_enabled": global_nms_enabled,

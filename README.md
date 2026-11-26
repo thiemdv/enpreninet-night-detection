@@ -106,7 +106,7 @@ Các chỉ số đánh giá được sử dụng trong nghiên cứu bao gồm *
 | **F08** | `notebooks/Colab_Runner.ipynb` | Notebook điều phối mỏng chạy ma trận thực nghiệm **E0–E5** trên Google Colab & lưu Google Drive |
 
 **Ma trận thực nghiệm (E0–E5):**
-- **GPU Pilot (Khuyến nghị trước full training):** 200 ảnh ban đêm thật, 2 epochs để kiểm chứng bộ nhớ GPU T4 (`batch_size=2` cho Faster R-CNN ResNet-152), loss hữu hạn, `dataset_fingerprint` và đường ống E0–E5 đầu cuối.
+- **GPU Pilot (Khuyến nghị trước full training):** 200 ảnh ban đêm thật, 2 epochs, cô lập dưới `--run-id pilot` (`runs/pilot/`, `weights/pilot/`, `artifacts/pilot/`), chạy nhánh GHE (`E1` + `E3`) và hợp nhất (`E4` + `E5`) để kiểm chứng tương thích runtime YOLOv5 `v7.0`, bộ nhớ GPU T4 (`batch_size=2` cho Faster R-CNN ResNet-152) và loss hữu hạn trước khi train full E0–E5.
 - **E0:** Baseline YOLOv5l (`v7.0`, COCO pretrained) trên ảnh ban đêm gốc (chưa GHE).
 - **E1:** GHE-YOLOv5l trên ảnh `standard_local_he` (hỗ trợ đối chứng mở rộng với `fig4_literal` & `fig4_normalized`).
 - **E2:** Baseline Faster R-CNN ResNet-152 (ImageNet-pretrained backbone + detection head khởi tạo mới) trên ảnh ban đêm gốc.

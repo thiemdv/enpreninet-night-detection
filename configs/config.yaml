@@ -55,13 +55,13 @@ preprocessing:
 
 models:
   yolov5:
-    variant: "yolov5l" # Big variant (CSPDarknet + PANet)
+    variant: "yolov5l" # Big variant (CSPDarknet + PANet), pinned to v7.0 on Colab
     img_size: 640
     batch_size: 16
     epochs: 50
-    conf_thres: 0.25
-    iou_thres: 0.45
-    weights: "weights/yolov5l_enpreninet.pt"
+    conf_thres: 0.25 # Reference operating threshold (inference uses CLI --score-floor 0.001 for full PR curve)
+    iou_thres: 0.45 # Reference YOLOv5 default (detect.py uses fusion.intra_nms_iou)
+    weights: "weights/full/yolov5l_enpreninet.pt" # Default relative path template (isolated by --run-id)
 
   faster_rcnn:
     backbone: "resnet152" # PyTorch equivalent to paper's ResNet-150 (resnet_fpn_backbone)
@@ -73,7 +73,7 @@ models:
     learning_rate: 0.005
     momentum: 0.9
     weight_decay: 0.0005
-    weights: "weights/frcnn_resnet152_enpreninet.pth"
+    weights: "weights/full/frcnn_resnet152_enpreninet.pth" # Default relative path template (isolated by --run-id)
 
 fusion:
   confidence_thresholds: [0.25, 0.50, 0.75]

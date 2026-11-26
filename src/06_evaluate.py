@@ -5,12 +5,13 @@ confidence thresholds [0.25, 0.50, 0.75] and AP@50/mAP@50, AP@75/mAP@75
 using Pascal VOC greedy best-IoU 1-to-1 matching with all-point PR interpolation
 (excluding 0-GT classes from mAP mean).
 
-Enforces strict image_id set equality (`set(preds) == set(gt)`) and verifies
-`dataset_fingerprint` consistency between prediction sidecar metadata and COCO GT.
+Enforces fail-closed validation of `dataset_fingerprint` and `eval_split`
+between every prediction `.meta.json` sidecar and COCO GT (opt-in override
+via `--allow-legacy-predictions`), plus strict `set(preds) == set(gt)` equality.
 
 Usage:
     python src/06_evaluate.py --config configs/config.yaml --dummy --device cpu
-    python src/06_evaluate.py --config configs/config.yaml --preds E0=runs/yolo_raw/yolo_raw_test_preds.pt E5=runs/fusion_standard_local_he/fusion_standard_local_he_e5_full_test_preds.pt
+    python src/06_evaluate.py --config configs/config.yaml --run-id pilot --data-root /content/work/pilot_processed --preds ...
 """
 
 from __future__ import annotations
@@ -39,11 +40,53 @@ def resolve_path(path_str: str) -> Path:
     return p if p.is_absolute() else (REPO_ROOT / p)
 
 
+def resolve_eval_output_paths(cfg: dict[str, Any], run_id: str) -> tuple[Path, Path]:
+    """Return isolated (json_report_path, md_table_path) under artifacts/<run_id>/."""
+    out_dir = resolve_path(cfg["paths"]["artifacts_dir"]) / run_id
+    return out_dir / "metrics_report.json", out_dir / "ablation_table.md"
+
+
 def read_prediction_meta(preds_path: Path) -> dict[str, Any] | None:
     meta_path = preds_path.with_name(f"{preds_path.name}.meta.json")
     if not meta_path.is_file():
         return None
     return json.loads(meta_path.read_text(encoding="utf-8"))
+
+
+def verify_prediction_against_gt(
+    model_name: str,
+    pred_path: Path,
+    gt_fingerprint: str | None,
+    eval_split: str,
+    allow_legacy: bool = False,
+) -> dict[str, Any]:
+    """A02 fail-closed check: verify prediction sidecar matches GT dataset_fingerprint & eval_split."""
+    pred_meta = read_prediction_meta(pred_path)
+    if not allow_legacy and pred_meta is None:
+        raise ValueError(
+            f"Missing sidecar metadata (.meta.json) for '{model_name}' ({pred_path}). "
+            f"Pass --allow-legacy-predictions to override."
+        )
+    pm = pred_meta or {}
+    pred_fp = pm.get("dataset_fingerprint")
+
+    if not allow_legacy and (not gt_fingerprint or not pred_fp):
+        raise ValueError(
+            f"Missing dataset_fingerprint for '{model_name}': pred={pred_fp}, gt={gt_fingerprint}. "
+            f"Pass --allow-legacy-predictions to override."
+        )
+    if gt_fingerprint and pred_fp and str(pred_fp) != str(gt_fingerprint):
+        raise ValueError(
+            f"Dataset fingerprint mismatch for '{model_name}': "
+            f"pred={pred_fp} != gt={gt_fingerprint}. Refusing to evaluate mismatched dataset/split."
+        )
+
+    pred_split = pm.get("eval_split")
+    if pred_split and str(pred_split) != str(eval_split):
+        raise ValueError(
+            f"Eval split mismatch for '{model_name}': pred={pred_split} != requested eval_split={eval_split}."
+        )
+    return pm
 
 
 def compute_iou_matrix(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
@@ -67,7 +110,6 @@ def compute_iou_matrix(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tens
 
 
 def _compute_ap_all_point(recalls: np.ndarray, precisions: np.ndarray) -> float:
-    """Compute Average Precision using all-point Precision-Recall interpolation."""
     if recalls.size == 0:
         return 0.0
     mrec = np.concatenate(([0.0], recalls, [1.0]))
@@ -88,14 +130,14 @@ def _match_class_detections(
     conf_threshold: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """Pascal VOC greedy best-IoU 1-to-1 matching for a single class at given IoU & confidence thresholds."""
-    all_image_ids = sorted(gt_by_image.keys())
+    all_image_ids = sorted(set(gt_by_image.keys()) | set(preds_by_image.keys()))
 
     gt_boxes_map: dict[int, torch.Tensor] = {}
     gt_matched_map: dict[int, list[bool]] = {}
     total_gt = 0
     for img_id in all_image_ids:
-        gt = gt_by_image[img_id]
-        if gt["boxes"].numel() > 0:
+        gt = gt_by_image.get(img_id)
+        if gt is not None and gt["boxes"].numel() > 0:
             mask = gt["labels"].to(torch.long) == class_id
             cls_boxes = gt["boxes"][mask].detach().cpu().to(torch.float32)
         else:
@@ -106,8 +148,9 @@ def _match_class_detections(
 
     det_records: list[tuple[float, int, torch.Tensor]] = []
     for img_id in all_image_ids:
-        pred = preds_by_image[img_id]
-        if pred["boxes"].numel() == 0:
+        # A08 fix: safe .get() so strict_image_ids=False never triggers KeyError
+        pred = preds_by_image.get(img_id)
+        if pred is None or pred["boxes"].numel() == 0:
             continue
         boxes = pred["boxes"].detach().cpu().to(torch.float32)
         scores = pred["scores"].detach().cpu().to(torch.float32)
@@ -156,11 +199,7 @@ def evaluate_predictions(
     conf_thresholds: list[float] | tuple[float, ...] = (0.25, 0.50, 0.75),
     strict_image_ids: bool = True,
 ) -> dict[str, Any]:
-    """Evaluate unified predictions against ground truth across IoU and confidence thresholds.
-
-    P0 fix: enforces strict set(preds_by_image) == set(gt_by_image) when strict_image_ids=True.
-    Uses Pascal VOC greedy best-IoU 1-to-1 matching + all-point PR interpolation.
-    """
+    """Evaluate unified predictions against ground truth across IoU and confidence thresholds."""
     pred_ids = set(preds_by_image.keys())
     gt_ids = set(gt_by_image.keys())
     if strict_image_ids and pred_ids != gt_ids:
@@ -283,7 +322,6 @@ def evaluate_predictions(
 
 
 def load_coco_ground_truth(coco_json_path: Path) -> tuple[dict[int, dict[str, torch.Tensor]], str | None]:
-    """Load COCO instances_*.json into ({image_id: {'boxes': xyxy, 'labels': 0..2}}, dataset_fingerprint)."""
     if not coco_json_path.is_file():
         raise FileNotFoundError(f"Ground truth COCO JSON not found: {coco_json_path}")
     data = json.loads(coco_json_path.read_text(encoding="utf-8"))
@@ -318,9 +356,8 @@ def load_coco_ground_truth(coco_json_path: Path) -> tuple[dict[int, dict[str, to
 
 
 def format_ablation_markdown(report: dict[str, Any]) -> str:
-    """Format model evaluation results into a clean Markdown comparison table."""
     lines = [
-        f"# EnPreNiNet Evaluation & Ablation Summary ({report['mode']} | split={report['eval_split']})",
+        f"# EnPreNiNet Evaluation & Ablation Summary (run_id={report['run_id']} | split={report['eval_split']})",
         "",
         f"> **Protocol:** `{report['matching_protocol']}` (Pascal VOC greedy best-IoU 1-to-1 matching + all-point PR interpolation; 0-GT classes excluded from mAP mean).",
         f"> **Dataset Fingerprint:** `{report.get('dataset_fingerprint')}`",
@@ -345,11 +382,10 @@ def format_ablation_markdown(report: dict[str, Any]) -> str:
 def parse_pred_specs(
     pred_args: list[str] | None,
     cfg: dict[str, Any],
+    run_id: str,
     image_variant: str,
     eval_split: str,
-    dummy: bool,
 ) -> dict[str, Path]:
-    """Parse --preds name=path entries or auto-discover default yolo/frcnn/fusion prediction files."""
     if pred_args:
         parsed: dict[str, Path] = {}
         for item in pred_args:
@@ -359,23 +395,23 @@ def parse_pred_specs(
             parsed[name.strip()] = resolve_path(raw_path.strip())
         return parsed
 
-    runs_dir = resolve_path(cfg["paths"]["runs_dir"])
-    prefix = "dummy_" if dummy else ""
+    run_root = resolve_path(cfg["paths"]["runs_dir"]) / run_id
     return {
-        "yolo": runs_dir / f"{prefix}yolo_{image_variant}" / f"yolo_{image_variant}_{eval_split}_preds.pt",
-        "frcnn": runs_dir / f"{prefix}frcnn_{image_variant}" / f"frcnn_{image_variant}_{eval_split}_preds.pt",
-        "fusion": runs_dir / f"{prefix}fusion_{image_variant}" / f"fusion_{image_variant}_{eval_split}_preds.pt",
+        "yolo": run_root / f"yolo_{image_variant}" / f"yolo_{image_variant}_{eval_split}_preds.pt",
+        "frcnn": run_root / f"frcnn_{image_variant}" / f"frcnn_{image_variant}_{eval_split}_preds.pt",
+        "fusion": run_root / f"fusion_{image_variant}" / f"fusion_{image_variant}_{eval_split}_preds.pt",
     }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate EnPreNiNet detectors and fusion outputs.")
     parser.add_argument("--config", type=Path, default=Path("configs/config.yaml"), help="Path to config.yaml")
+    parser.add_argument("--run-id", type=str, default=None, help="Run namespace isolating outputs (dummy, pilot, full)")
     parser.add_argument(
         "--preds",
         nargs="+",
         default=None,
-        help="List of name=path/to/preds.pt entries to evaluate (defaults to yolo, frcnn, fusion)",
+        help="List of name=path/to/preds.pt entries to evaluate (defaults to yolo, frcnn, fusion in runs/<run_id>/)",
     )
     parser.add_argument(
         "--image-variant",
@@ -389,7 +425,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-split", type=str, choices=("val", "test"), default="test", help="Evaluation split")
     parser.add_argument("--output-dir", type=Path, default=None, help="Override artifacts output directory")
     parser.add_argument("--device", type=str, default=None, help="Device flag (evaluation runs on CPU tensors)")
-    parser.add_argument("--dummy", action="store_true", help="Evaluate dummy runs against data/dummy_processed GT")
+    parser.add_argument(
+        "--allow-legacy-predictions",
+        action="store_true",
+        default=False,
+        help="Allow evaluating prediction .pt files lacking .meta.json fingerprints",
+    )
+    parser.add_argument("--dummy", action="store_true", help="Evaluate runs/dummy/ against data/dummy_processed GT")
     return parser.parse_args()
 
 
@@ -398,12 +440,18 @@ def main() -> None:
     config_path = args.config if args.config.is_absolute() else (REPO_ROOT / args.config)
     cfg = load_config(config_path)
 
+    run_id = args.run_id or ("dummy" if args.dummy else "full")
     image_variant = args.image_variant or str(cfg["preprocessing"]["ghe_ensemble"]["method"])
     default_root = resolve_path(cfg["paths"]["data_dummy_processed"] if args.dummy else cfg["paths"]["data_processed"])
     data_root = args.data_root or default_root
     gt_coco_path = args.gt_coco or (data_root / cfg["paths"]["coco_subdir"] / f"instances_{args.eval_split}.json")
-    output_dir = args.output_dir or resolve_path(cfg["paths"]["artifacts_dir"])
-    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.output_dir is not None:
+        json_path = args.output_dir / "metrics_report.json"
+        md_path = args.output_dir / "ablation_table.md"
+    else:
+        json_path, md_path = resolve_eval_output_paths(cfg, run_id=run_id)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
 
     gt_by_image, gt_fingerprint = load_coco_ground_truth(gt_coco_path)
     class_names = {int(k): str(v) for k, v in cfg["dataset"]["classes"].items()}
@@ -413,9 +461,9 @@ def main() -> None:
     pred_specs = parse_pred_specs(
         pred_args=args.preds,
         cfg=cfg,
+        run_id=run_id,
         image_variant=image_variant,
         eval_split=args.eval_split,
-        dummy=args.dummy,
     )
 
     models_report: dict[str, Any] = {}
@@ -423,13 +471,13 @@ def main() -> None:
         if not pred_path.is_file():
             raise FileNotFoundError(f"Prediction file for '{model_name}' not found: {pred_path}")
 
-        pred_meta = read_prediction_meta(pred_path) or {}
-        pred_fp = pred_meta.get("dataset_fingerprint")
-        if gt_fingerprint and pred_fp and pred_fp != gt_fingerprint:
-            raise ValueError(
-                f"Dataset fingerprint mismatch for '{model_name}': "
-                f"pred={pred_fp} != gt={gt_fingerprint}. Refusing to evaluate mismatched dataset/split."
-            )
+        verify_prediction_against_gt(
+            model_name=model_name,
+            pred_path=pred_path,
+            gt_fingerprint=gt_fingerprint,
+            eval_split=args.eval_split,
+            allow_legacy=args.allow_legacy_predictions,
+        )
 
         preds_by_image = torch.load(pred_path, weights_only=True)
         models_report[model_name] = evaluate_predictions(
@@ -443,6 +491,7 @@ def main() -> None:
 
     report = {
         "mode": "dummy" if args.dummy else "real",
+        "run_id": run_id,
         "eval_split": args.eval_split,
         "image_variant": image_variant,
         "gt_coco": str(gt_coco_path),
@@ -453,10 +502,6 @@ def main() -> None:
         "models": models_report,
     }
 
-    prefix = "dummy_" if args.dummy else ""
-    json_path = output_dir / f"{prefix}metrics_report.json"
-    md_path = output_dir / f"{prefix}ablation_table.md"
-
     json_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     md_path.write_text(format_ablation_markdown(report), encoding="utf-8")
 
@@ -464,7 +509,7 @@ def main() -> None:
         name: {k: round(float(m[k]), 4) for k in ("precision", "recall", "f1", "map50", "map75")}
         for name, m in models_report.items()
     }
-    print(f"[06_evaluate] Completed -> {json_path} & {md_path}")
+    print(f"[06_evaluate] Completed (run_id={run_id}) -> {json_path} & {md_path}")
     print(json.dumps(compact, indent=2))
 
 

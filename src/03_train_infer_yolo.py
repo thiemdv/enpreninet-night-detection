@@ -5,18 +5,19 @@ predictions in the EnPreNiNet unified prediction schema:
     {
         image_id: {
             "boxes": FloatTensor[N, 4],  # xyxy in [0, 640]
-            "scores": FloatTensor[N],    # confidence in [0, 1]
+            "scores": FloatTensor[N],    # detector confidence score in [0, 1]
             "labels": LongTensor[N],     # canonical class IDs in {0, 1, 2}
         }
     }
 
-Saves a companion `.meta.json` sidecar containing `dataset_fingerprint`,
-`eval_split`, `image_variant`, and `yolo_repo_commit` (when applicable).
-Cleans stale YOLO dataset views and stale inference directories before each run.
+Isolates all outputs under `--run-id` (`runs/<run_id>/yolo_<variant>/`,
+`weights/<run_id>/yolov5l_<variant>.pt`), supports `--work-dir` for local SSD
+YOLO dataset views, and validates `ghe_meta.json["dataset_fingerprint"]` before
+training/inferring on any GHE variant.
 
 Usage:
     python src/03_train_infer_yolo.py --config configs/config.yaml --dummy --epochs 1 --device cpu
-    python src/03_train_infer_yolo.py --config configs/config.yaml --yolo-repo /content/yolov5 --image-variant standard_local_he
+    python src/03_train_infer_yolo.py --config configs/config.yaml --run-id pilot --yolo-repo /content/yolov5 --work-dir /content/work/yolo_views/pilot --image-variant standard_local_he
 """
 
 from __future__ import annotations
@@ -49,6 +50,24 @@ def resolve_path(path_str: str) -> Path:
     return p if p.is_absolute() else (REPO_ROOT / p)
 
 
+def resolve_yolo_output_paths(
+    cfg: dict[str, Any],
+    run_id: str,
+    image_variant: str,
+    eval_split: str,
+    dummy: bool = False,
+) -> tuple[Path, Path, Path]:
+    """Return isolated (run_dir, ckpt_path, preds_path) under runs/<run_id>/ and weights/<run_id>/."""
+    run_dir = resolve_path(cfg["paths"]["runs_dir"]) / run_id / f"yolo_{image_variant}"
+    preds_path = run_dir / f"yolo_{image_variant}_{eval_split}_preds.pt"
+    if dummy:
+        ckpt_path = run_dir / f"yolov5l_dummy_{image_variant}.pt"
+    else:
+        variant_name = str(cfg["models"]["yolov5"]["variant"])
+        ckpt_path = resolve_path(cfg["paths"]["weights_dir"]) / run_id / f"{variant_name}_{image_variant}.pt"
+    return run_dir, ckpt_path, preds_path
+
+
 def select_device(device_arg: str | None, cfg: dict[str, Any]) -> torch.device:
     req = (device_arg or str(cfg["project"]["device"])).lower()
     if req == "auto":
@@ -74,6 +93,34 @@ def load_coco_split_images(coco_json_path: Path) -> tuple[list[dict[str, Any]], 
     return list(data.get("images", [])), (str(fp) if fp else None)
 
 
+def verify_ghe_metadata(
+    data_root: Path,
+    image_variant: str,
+    expected_dataset_fp: str | None,
+) -> dict[str, Any] | None:
+    """A03 fix: verify GHE images match the current dataset_fingerprint before training/inference."""
+    if image_variant == "raw":
+        return None
+    ghe_meta_path = data_root / "images" / image_variant / "ghe_meta.json"
+    if not ghe_meta_path.is_file():
+        raise FileNotFoundError(
+            f"Missing GHE metadata file: {ghe_meta_path}. Re-run src/02_ghe_ensemble.py for '{image_variant}'."
+        )
+    ghe_meta = json.loads(ghe_meta_path.read_text(encoding="utf-8"))
+    ghe_fp = ghe_meta.get("dataset_fingerprint")
+    if not expected_dataset_fp or not ghe_fp:
+        raise ValueError(
+            f"Missing dataset_fingerprint in COCO ({expected_dataset_fp}) or {ghe_meta_path} ({ghe_fp})."
+        )
+    if str(ghe_fp) != str(expected_dataset_fp):
+        raise ValueError(
+            f"Stale GHE images detected for '{image_variant}': "
+            f"ghe_meta.dataset_fingerprint={ghe_fp} != coco.dataset_fingerprint={expected_dataset_fp}. "
+            f"Re-run src/02_ghe_ensemble.py before training."
+        )
+    return ghe_meta
+
+
 def _read_git_commit(repo_dir: Path) -> str | None:
     try:
         res = subprocess.run(
@@ -88,14 +135,12 @@ def _read_git_commit(repo_dir: Path) -> str | None:
 
 
 def save_prediction_meta(preds_path: Path, meta: dict[str, Any]) -> Path:
-    """Write sidecar metadata JSON next to prediction .pt file."""
     meta_path = preds_path.with_name(f"{preds_path.name}.meta.json")
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return meta_path
 
 
 def empty_prediction() -> dict[str, torch.Tensor]:
-    """Return an empty unified prediction entry with exact shapes and dtypes."""
     return {
         "boxes": torch.empty((0, 4), dtype=torch.float32),
         "scores": torch.empty((0,), dtype=torch.float32),
@@ -181,6 +226,7 @@ def _read_image_tensor(img_path: Path, img_size: int) -> torch.Tensor:
 def run_dummy_yolo(
     cfg: dict[str, Any],
     data_root: Path,
+    run_id: str,
     image_variant: str,
     eval_split: str,
     epochs: int,
@@ -198,6 +244,7 @@ def run_dummy_yolo(
 
     train_images, _ = load_coco_split_images(coco_dir / "instances_train.json")
     eval_images, dataset_fp = load_coco_split_images(coco_dir / f"instances_{eval_split}.json")
+    ghe_meta = verify_ghe_metadata(data_root, image_variant, dataset_fp)
     if not train_images:
         raise RuntimeError("No training images found in dummy dataset. Run F02/F03 first.")
 
@@ -224,17 +271,20 @@ def run_dummy_yolo(
         loss.backward()
         optimizer.step()
 
-    run_dir = resolve_path(cfg["paths"]["runs_dir"]) / f"dummy_yolo_{image_variant}"
+    run_dir, ckpt_path, preds_path = resolve_yolo_output_paths(
+        cfg, run_id=run_id, image_variant=image_variant, eval_split=eval_split, dummy=True
+    )
     run_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = run_dir / f"yolov5l_dummy_{image_variant}.pt"
     torch.save(
         {
             "model_state_dict": model.state_dict(),
             "variant": cfg["models"]["yolov5"]["variant"],
+            "run_id": run_id,
             "image_variant": image_variant,
             "img_size": img_size,
             "num_classes": num_classes,
             "dataset_fingerprint": dataset_fp,
+            "preprocessing_fingerprint": (ghe_meta or {}).get("preprocessing_fingerprint"),
             "dummy": True,
         },
         ckpt_path,
@@ -271,16 +321,17 @@ def run_dummy_yolo(
                 num_classes=num_classes,
             )
 
-    preds_path = run_dir / f"yolo_{image_variant}_{eval_split}_preds.pt"
     torch.save(preds_by_image, preds_path)
     save_prediction_meta(
         preds_path,
         {
             "model": "dummy_yolo",
+            "run_id": run_id,
             "image_variant": image_variant,
             "eval_split": eval_split,
             "score_floor": score_floor,
             "dataset_fingerprint": dataset_fp,
+            "preprocessing_fingerprint": (ghe_meta or {}).get("preprocessing_fingerprint"),
             "num_eval_images": len(preds_by_image),
             "dummy": True,
         },
@@ -294,10 +345,7 @@ def _prepare_yolo_view(
     image_variant: str,
     view_root: Path,
 ) -> Path:
-    """Create a fresh YOLOv5-compatible dataset view strictly from current split manifests.
-
-    P0 fix: deletes stale view_root before rebuilding so outdated images/labels are never reused.
-    """
+    """Create a fresh YOLOv5-compatible dataset view strictly from current split manifests."""
     if view_root.exists():
         shutil.rmtree(view_root)
 
@@ -341,7 +389,6 @@ def _prepare_yolo_view(
 
 
 def _parse_yolo_txt_to_xyxy(txt_path: Path, img_size: int) -> np.ndarray | None:
-    """Parse YOLOv5 detect.py --save-txt --save-conf output (cls cx cy w h conf) to [N, 6] xyxy."""
     if not txt_path.is_file():
         return None
     rows: list[list[float]] = []
@@ -364,6 +411,7 @@ def _parse_yolo_txt_to_xyxy(txt_path: Path, img_size: int) -> np.ndarray | None:
 def run_real_yolo(
     cfg: dict[str, Any],
     data_root: Path,
+    run_id: str,
     yolo_repo: Path,
     image_variant: str,
     eval_split: str,
@@ -371,6 +419,7 @@ def run_real_yolo(
     batch_size: int,
     device_str: str,
     score_floor: float,
+    work_dir: Path | None = None,
 ) -> tuple[Path, Path]:
     """Train YOLOv5l via local ultralytics/yolov5 repo and export unified predictions."""
     train_py = yolo_repo / "train.py"
@@ -378,17 +427,24 @@ def run_real_yolo(
     if not train_py.is_file() or not detect_py.is_file():
         raise FileNotFoundError(f"Expected train.py and detect.py inside --yolo-repo: {yolo_repo}")
 
+    coco_dir = data_root / cfg["paths"]["coco_subdir"]
+    eval_images, dataset_fp = load_coco_split_images(coco_dir / f"instances_{eval_split}.json")
+    ghe_meta = verify_ghe_metadata(data_root, image_variant, dataset_fp)
+
     seed = int(cfg["project"]["seed"])
     yolo_cfg = cfg["models"]["yolov5"]
     img_size = int(yolo_cfg["img_size"])
     num_classes = len(cfg["dataset"]["classes"])
     intra_nms_iou = float(cfg["fusion"]["intra_nms_iou"])
 
-    run_dir = resolve_path(cfg["paths"]["runs_dir"]) / f"yolo_{image_variant}"
+    run_dir, exported_weights, preds_path = resolve_yolo_output_paths(
+        cfg, run_id=run_id, image_variant=image_variant, eval_split=eval_split, dummy=False
+    )
     run_dir.mkdir(parents=True, exist_ok=True)
+    exported_weights.parent.mkdir(parents=True, exist_ok=True)
 
-    # P0 fix: rebuild clean dataset view from current manifests
-    view_root = run_dir / "yolo_view"
+    # A05 fix: allow local SSD work_dir for yolo_view so YOLOv5 does not read images from Google Drive
+    view_root = (work_dir / f"yolo_view_{image_variant}") if work_dir is not None else (run_dir / "yolo_view")
     dataset_yaml = _prepare_yolo_view(cfg, data_root, image_variant, view_root)
 
     train_out_dir = run_dir / "train"
@@ -421,15 +477,11 @@ def run_real_yolo(
     subprocess.run(train_cmd, check=True)
 
     best_pt = run_dir / "train" / "weights" / "best.pt"
-    weights_dir = resolve_path(cfg["paths"]["weights_dir"])
-    weights_dir.mkdir(parents=True, exist_ok=True)
-    exported_weights = weights_dir / f"{yolo_cfg['variant']}_{image_variant}.pt"
     if best_pt.is_file():
         shutil.copy2(best_pt, exported_weights)
     else:
         raise FileNotFoundError(f"YOLOv5 training finished without producing {best_pt}")
 
-    # P0 fix: remove stale inference directory before detect.py so old TXT files cannot be mixed/appended
     infer_dir = run_dir / f"infer_{eval_split}"
     if infer_dir.exists():
         shutil.rmtree(infer_dir)
@@ -461,10 +513,7 @@ def run_real_yolo(
     ]
     subprocess.run(detect_cmd, check=True)
 
-    coco_dir = data_root / cfg["paths"]["coco_subdir"]
-    eval_images, dataset_fp = load_coco_split_images(coco_dir / f"instances_{eval_split}.json")
     labels_out_dir = infer_dir / "labels"
-
     preds_by_image: dict[int, dict[str, torch.Tensor]] = {}
     for entry in eval_images:
         img_id = int(entry["id"])
@@ -477,17 +526,18 @@ def run_real_yolo(
             num_classes=num_classes,
         )
 
-    preds_path = run_dir / f"yolo_{image_variant}_{eval_split}_preds.pt"
     torch.save(preds_by_image, preds_path)
     save_prediction_meta(
         preds_path,
         {
             "model": str(yolo_cfg["variant"]),
+            "run_id": run_id,
             "image_variant": image_variant,
             "eval_split": eval_split,
             "score_floor": score_floor,
             "seed": seed,
             "dataset_fingerprint": dataset_fp,
+            "preprocessing_fingerprint": (ghe_meta or {}).get("preprocessing_fingerprint"),
             "yolo_repo_commit": _read_git_commit(yolo_repo),
             "num_eval_images": len(preds_by_image),
             "dummy": False,
@@ -499,6 +549,7 @@ def run_real_yolo(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train & infer YOLOv5l and export unified predictions.")
     parser.add_argument("--config", type=Path, default=Path("configs/config.yaml"), help="Path to config.yaml")
+    parser.add_argument("--run-id", type=str, default=None, help="Run namespace isolating outputs (dummy, pilot, full)")
     parser.add_argument(
         "--image-variant",
         type=str,
@@ -507,6 +558,12 @@ def parse_args() -> argparse.Namespace:
         help="Input image variant (default: preprocessing.ghe_ensemble.method)",
     )
     parser.add_argument("--yolo-repo", type=Path, default=None, help="Path to local ultralytics/yolov5 repository")
+    parser.add_argument(
+        "--work-dir",
+        type=Path,
+        default=None,
+        help="Local SSD directory for temporary YOLO dataset view (avoids Google Drive I/O)",
+    )
     parser.add_argument("--epochs", type=int, default=None, help="Override training epochs")
     parser.add_argument("--batch-size", type=int, default=None, help="Override batch size")
     parser.add_argument("--device", type=str, default=None, help="Device: cpu, cuda, or auto")
@@ -522,6 +579,7 @@ def main() -> None:
     config_path = args.config if args.config.is_absolute() else (REPO_ROOT / args.config)
     cfg = load_config(config_path)
 
+    run_id = args.run_id or ("dummy" if args.dummy else "full")
     image_variant = args.image_variant or str(cfg["preprocessing"]["ghe_ensemble"]["method"])
     epochs = args.epochs if args.epochs is not None else int(cfg["models"]["yolov5"]["epochs"])
     batch_size = args.batch_size if args.batch_size is not None else int(cfg["models"]["yolov5"]["batch_size"])
@@ -532,6 +590,7 @@ def main() -> None:
         ckpt_path, preds_path = run_dummy_yolo(
             cfg=cfg,
             data_root=data_root,
+            run_id=run_id,
             image_variant=image_variant,
             eval_split=args.eval_split,
             epochs=epochs,
@@ -546,6 +605,7 @@ def main() -> None:
         ckpt_path, preds_path = run_real_yolo(
             cfg=cfg,
             data_root=data_root,
+            run_id=run_id,
             yolo_repo=args.yolo_repo,
             image_variant=image_variant,
             eval_split=args.eval_split,
@@ -553,11 +613,13 @@ def main() -> None:
             batch_size=batch_size,
             device_str=yolo_device,
             score_floor=args.score_floor,
+            work_dir=args.work_dir,
         )
 
     preds = torch.load(preds_path, weights_only=True)
     summary = {
         "mode": "dummy" if args.dummy else "real",
+        "run_id": run_id,
         "image_variant": image_variant,
         "eval_split": args.eval_split,
         "device": str(device),

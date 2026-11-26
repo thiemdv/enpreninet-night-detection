@@ -9,17 +9,18 @@ transformation modes:
 
 Reads split manifests from <root>/splits/{train,val,test}.txt, cleans stale
 outputs under <root>/images/<method>/, writes lossless (640, 640, 3) PNG images,
-records preprocessing metadata + timing in ghe_meta.json, and saves a visual
-comparison + histogram artifact in artifacts/.
+records preprocessing metadata + preprocessing_fingerprint + timing in ghe_meta.json,
+and saves a visual comparison artifact under artifacts/<run_id>/.
 
 Usage:
     python src/02_ghe_ensemble.py --config configs/config.yaml --dummy
-    python src/02_ghe_ensemble.py --config configs/config.yaml --method fig4_normalized
+    python src/02_ghe_ensemble.py --config configs/config.yaml --run-id pilot --data-root /content/work/pilot_processed
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shutil
 import time
@@ -58,6 +59,16 @@ def load_config(config_path: Path) -> dict[str, Any]:
 def resolve_path(path_str: str) -> Path:
     p = Path(path_str)
     return p if p.is_absolute() else (REPO_ROOT / p)
+
+
+def resolve_ghe_artifact_path(cfg: dict[str, Any], run_id: str, method: str) -> Path:
+    """Resolve isolated comparison artifact path under artifacts/<run_id>/."""
+    return resolve_path(cfg["paths"]["artifacts_dir"]) / run_id / f"ghe_comparison_{method}.png"
+
+
+def compute_preprocessing_fingerprint(params: dict[str, Any]) -> str:
+    payload = json.dumps(params, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def build_gaussian_kernel(kernel_size: int = 3, sigma: float = 2.0) -> np.ndarray:
@@ -128,12 +139,10 @@ def sliding_window_ghe(
     for r0 in range(0, height, chunk_rows):
         r1 = min(r0 + chunk_rows, height)
         strip = padded[r0 : r1 + 2 * pad, :]
-        # sliding_window_view is zero-copy; reshape may materialize chunk-sized buffer
         windows = sliding_window_view(strip, (window_size, window_size))
         windows_flat = windows.reshape(r1 - r0, width, window_size * window_size)
 
         centers = gray_gauss[r0:r1, :]
-        # Exact cumulative frequency sum_{j=0}^{x_c} f(j) equals count of window pixels <= x_c
         count_le = (windows_flat <= centers[..., None]).sum(axis=-1, dtype=np.int32).astype(np.float64)
         h_max = windows_flat.max(axis=-1).astype(np.float64)
         zero_mask = h_max == 0.0
@@ -295,7 +304,6 @@ def process_dataset(
             f"Split manifests directory not found: {splits_root}. Run src/01_prepare_bdd.py first."
         )
 
-    # Clean stale outputs for this method before writing fresh PNGs
     if out_root.exists():
         shutil.rmtree(out_root)
     out_root.mkdir(parents=True, exist_ok=True)
@@ -363,7 +371,8 @@ def process_dataset(
             chunk_rows=chunk_rows,
         )
 
-    stats: dict[str, Any] = {
+    preproc_params = {
+        "dataset_fingerprint": dataset_fingerprint,
         "method": method,
         "image_size": image_size,
         "gaussian_kernel_size": k_size,
@@ -372,8 +381,11 @@ def process_dataset(
         "border_mode": border_mode,
         "zero_division_policy": zero_division_policy,
         "uniform_window_policy": uniform_window_policy,
+    }
+    stats: dict[str, Any] = {
+        **preproc_params,
+        "preprocessing_fingerprint": compute_preprocessing_fingerprint(preproc_params),
         "chunk_rows": chunk_rows,
-        "dataset_fingerprint": dataset_fingerprint,
         "total_images": total_images,
         "elapsed_seconds": round(elapsed_sec, 4),
         "ms_per_image": round(ms_per_image, 2),
@@ -389,6 +401,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Apply 15-step GHE Ensemble preprocessing to night-vision images.")
     parser.add_argument("--config", type=Path, default=Path("configs/config.yaml"), help="Path to config.yaml")
     parser.add_argument("--dummy", action="store_true", help="Run on isolated data/dummy_processed")
+    parser.add_argument("--run-id", type=str, default=None, help="Run namespace for artifacts (dummy, pilot, full)")
     parser.add_argument("--method", type=str, choices=VALID_METHODS, default=None, help="Override GHE mode")
     parser.add_argument("--window-size", type=int, default=None, help="Override sliding window size W")
     parser.add_argument("--border-mode", type=str, default=None, help="Override border padding mode")
@@ -405,18 +418,16 @@ def main() -> None:
     cfg = load_config(config_path)
     ghe_cfg = cfg["preprocessing"]["ghe_ensemble"]
 
+    run_id = args.run_id or ("dummy" if args.dummy else "full")
     method = args.method or str(ghe_cfg["method"])
     window_size = args.window_size if args.window_size is not None else int(ghe_cfg["window_size"])
     border_mode = args.border_mode or str(ghe_cfg["border_mode"])
     zero_div = args.zero_division_policy or str(ghe_cfg["zero_division_policy"])
     uniform_pol = args.uniform_window_policy or str(ghe_cfg["uniform_window_policy"])
 
-    if args.dummy:
-        data_root = args.data_root or resolve_path(cfg["paths"]["data_dummy_processed"])
-        artifact_path = resolve_path(cfg["paths"]["artifacts_dir"]) / "ghe_comparison_dummy.png"
-    else:
-        data_root = args.data_root or resolve_path(cfg["paths"]["data_processed"])
-        artifact_path = resolve_path(cfg["paths"]["artifacts_dir"]) / f"ghe_comparison_{method}.png"
+    default_root = resolve_path(cfg["paths"]["data_dummy_processed"] if args.dummy else cfg["paths"]["data_processed"])
+    data_root = args.data_root or default_root
+    artifact_path = resolve_ghe_artifact_path(cfg, run_id=run_id, method=method)
 
     stats = process_dataset(
         cfg=cfg,
@@ -429,7 +440,7 @@ def main() -> None:
         chunk_rows=args.chunk_rows,
         artifact_path=artifact_path,
     )
-    print(f"[02_ghe_ensemble] Completed ({'dummy' if args.dummy else 'full'})")
+    print(f"[02_ghe_ensemble] Completed (run_id={run_id})")
     print(json.dumps(stats, indent=2))
 
 

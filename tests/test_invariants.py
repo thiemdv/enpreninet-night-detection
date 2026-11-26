@@ -392,7 +392,7 @@ def test_ghe_output_shape_and_channels() -> None:
         assert np.array_equal(img[..., 0], img[..., 1])
         assert np.array_equal(img[..., 0], img[..., 2])
 
-    artifact_path = REPO_ROOT / cfg["paths"]["artifacts_dir"] / "ghe_comparison_dummy.png"
+    artifact_path = REPO_ROOT / cfg["paths"]["artifacts_dir"] / "dummy" / f"ghe_comparison_{method}.png"
     assert artifact_path.is_file() and artifact_path.stat().st_size > 0, (
         f"Missing or empty GHE comparison artifact: {artifact_path}"
     )
@@ -507,7 +507,7 @@ def test_yolo_output() -> None:
     img_size = int(cfg["models"]["yolov5"]["img_size"])
     valid_classes = set(int(k) for k in cfg["dataset"]["classes"].keys())
 
-    run_dir = REPO_ROOT / cfg["paths"]["runs_dir"] / f"dummy_yolo_{variant}"
+    run_dir = REPO_ROOT / cfg["paths"]["runs_dir"] / "dummy" / f"yolo_{variant}"
     preds_path = run_dir / f"yolo_{variant}_test_preds.pt"
     assert preds_path.is_file(), f"Missing YOLOv5 unified prediction file: {preds_path}"
 
@@ -580,7 +580,7 @@ def test_frcnn_output() -> None:
     img_size = int(cfg["models"]["faster_rcnn"]["img_size"])
     valid_classes = set(int(k) for k in cfg["dataset"]["classes"].keys())
 
-    run_dir = REPO_ROOT / cfg["paths"]["runs_dir"] / f"dummy_frcnn_{variant}"
+    run_dir = REPO_ROOT / cfg["paths"]["runs_dir"] / "dummy" / f"frcnn_{variant}"
     preds_path = run_dir / f"frcnn_{variant}_test_preds.pt"
     assert preds_path.is_file(), f"Missing Faster R-CNN unified prediction file: {preds_path}"
 
@@ -703,7 +703,7 @@ def test_fusion_output() -> None:
     thresholds = [float(t) for t in cfg["fusion"]["confidence_thresholds"]]
 
     preds_path = (
-        REPO_ROOT / cfg["paths"]["runs_dir"] / f"dummy_fusion_{variant}" / f"fusion_{variant}_test_preds.pt"
+        REPO_ROOT / cfg["paths"]["runs_dir"] / "dummy" / f"fusion_{variant}" / f"fusion_{variant}_test_preds.pt"
     )
     assert preds_path.is_file(), f"Missing fused prediction file: {preds_path}"
 
@@ -815,6 +815,12 @@ def test_fusion_output() -> None:
     assert fusion_meta_path.is_file(), f"Missing fusion sidecar meta: {fusion_meta_path}"
     fusion_meta = json.loads(fusion_meta_path.read_text(encoding="utf-8"))
     assert isinstance(fusion_meta.get("dataset_fingerprint"), str) and len(fusion_meta["dataset_fingerprint"]) == 64
+    # A08 audit: every confidence snapshot must also carry a companion .meta.json sidecar
+    for tau in thresholds:
+        snap_path = fusion_mod.snapshot_path_for_tau(preds_path, tau)
+        assert snap_path.is_file(), f"Missing confidence snapshot: {snap_path}"
+        snap_meta = snap_path.with_name(f"{snap_path.name}.meta.json")
+        assert snap_meta.is_file(), f"Missing sidecar meta for snapshot: {snap_meta}"
 
 
 def test_eval_output() -> None:
@@ -829,9 +835,9 @@ def test_eval_output() -> None:
     import torch
 
     cfg = load_config()
-    artifacts_dir = REPO_ROOT / cfg["paths"]["artifacts_dir"]
-    report_path = artifacts_dir / "dummy_metrics_report.json"
-    table_path = artifacts_dir / "dummy_ablation_table.md"
+    artifacts_dir = REPO_ROOT / cfg["paths"]["artifacts_dir"] / "dummy"
+    report_path = artifacts_dir / "metrics_report.json"
+    table_path = artifacts_dir / "ablation_table.md"
 
     assert report_path.is_file(), f"Missing evaluation JSON report: {report_path}"
     assert table_path.is_file() and table_path.stat().st_size > 0, f"Missing ablation table: {table_path}"
@@ -924,10 +930,12 @@ def test_eval_output() -> None:
     for k in ("precision", "recall", "f1", "map50", "map75"):
         assert math.isfinite(res_s4_no_gt[k]) and res_s4_no_gt[k] == 0.0
 
-    # P0 audit: mismatched image_id sets must raise ValueError
+    # P0 audit: mismatched image_id sets must raise ValueError; strict_image_ids=False must not KeyError
     mismatched_pred = {999: pred_s1[1]}
     with pytest.raises(ValueError, match="image_ids"):
         eval_mod.evaluate_predictions(mismatched_pred, gt_s1, class_names, strict_image_ids=True)
+    res_relaxed = eval_mod.evaluate_predictions(mismatched_pred, gt_s1, class_names, strict_image_ids=False)
+    assert math.isfinite(res_relaxed["map50"]) and res_relaxed["map50"] == 0.0
 
     # P1 audit: verify Pascal VOC greedy best-IoU matching protocol is recorded
     assert report.get("matching_protocol") == "pascal_voc_greedy_best_iou_all_point_ap"
@@ -995,4 +1003,119 @@ def test_notebook_clean() -> None:
         assert exp_tag in joined_code, f"Colab_Runner.ipynb missing experiment {exp_tag}"
     assert "checkout v7.0" in joined_code, "Expected pinned YOLOv5 tag v7.0 in Colab_Runner.ipynb"
     assert "/content/work/processed" in joined_code, "Expected local Colab SSD path for data/processed"
+    assert "/content/work/yolo_views/" in joined_code, "Expected local Colab SSD path for YOLOv5 dataset views"
+    assert "--run-id pilot" in joined_code and "--run-id full" in joined_code, (
+        "Expected isolated --run-id pilot and --run-id full namespaces in Colab_Runner.ipynb"
+    )
     assert "--max-images 200" in joined_code, "Expected GPU pilot cell in Colab_Runner.ipynb"
+
+
+# ---------------------------------------------------------------------------
+# Round-2 Pre-Training Integrity Tests (A01, A02, A03)
+# ---------------------------------------------------------------------------
+
+
+def _load_src_module(module_name: str, filename: str):
+    import importlib.util
+
+    path = REPO_ROOT / "src" / filename
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_fusion_rejects_missing_or_mismatched_fingerprint_and_variant(tmp_path: Path) -> None:
+    """A02: Fusion must fail-closed when a branch lacks a fingerprint or has mismatched variant/split."""
+    fusion_mod = _load_src_module("fusion_a02", "05_fusion.py")
+    yolo_pt = tmp_path / "yolo.pt"
+    frcnn_pt = tmp_path / "frcnn.pt"
+    yolo_pt.write_bytes(b"")
+    frcnn_pt.write_bytes(b"")
+
+    # 1. Missing sidecar on one branch -> rejected
+    fusion_mod.save_prediction_meta(
+        yolo_pt,
+        {"dataset_fingerprint": "a" * 64, "image_variant": "standard_local_he", "eval_split": "test"},
+    )
+    with pytest.raises(ValueError, match="Missing"):
+        fusion_mod.verify_and_resolve_branch_metadata(yolo_pt, frcnn_pt, allow_legacy=False)
+
+    # 2. Missing dataset_fingerprint value on one branch -> rejected
+    fusion_mod.save_prediction_meta(
+        frcnn_pt,
+        {"dataset_fingerprint": None, "image_variant": "standard_local_he", "eval_split": "test"},
+    )
+    with pytest.raises(ValueError, match="Missing dataset_fingerprint"):
+        fusion_mod.verify_and_resolve_branch_metadata(yolo_pt, frcnn_pt, allow_legacy=False)
+
+    # 3. Mismatched image_variant (raw vs standard_local_he) -> rejected
+    fusion_mod.save_prediction_meta(
+        frcnn_pt,
+        {"dataset_fingerprint": "a" * 64, "image_variant": "raw", "eval_split": "test"},
+    )
+    with pytest.raises(ValueError, match="Image variant mismatch"):
+        fusion_mod.verify_and_resolve_branch_metadata(yolo_pt, frcnn_pt, allow_legacy=False)
+
+
+def test_detectors_reject_stale_ghe_metadata(tmp_path: Path) -> None:
+    """A03: Both YOLO and Faster R-CNN wrappers must reject GHE images whose fingerprint != COCO fingerprint."""
+    yolo_mod = _load_src_module("yolo_a03", "03_train_infer_yolo.py")
+    frcnn_mod = _load_src_module("frcnn_a03", "04_train_infer_frcnn.py")
+
+    ghe_dir = tmp_path / "images" / "standard_local_he"
+    ghe_dir.mkdir(parents=True, exist_ok=True)
+    (ghe_dir / "ghe_meta.json").write_text(
+        json.dumps({"dataset_fingerprint": "1" * 64, "method": "standard_local_he"}), encoding="utf-8"
+    )
+
+    for mod in (yolo_mod, frcnn_mod):
+        with pytest.raises(ValueError, match="Stale GHE images"):
+            mod.verify_ghe_metadata(tmp_path, "standard_local_he", expected_dataset_fp="2" * 64)
+
+
+def test_evaluator_rejects_different_dataset_same_image_ids(tmp_path: Path) -> None:
+    """A02: Evaluator must reject predictions from a different dataset even when image_id keys match."""
+    eval_mod = _load_src_module("eval_a02", "06_evaluate.py")
+    pred_pt = tmp_path / "preds.pt"
+    pred_pt.write_bytes(b"")
+    (tmp_path / "preds.pt.meta.json").write_text(
+        json.dumps({"dataset_fingerprint": "a" * 64, "eval_split": "test"}), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="Dataset fingerprint mismatch"):
+        eval_mod.verify_prediction_against_gt(
+            model_name="E1",
+            pred_path=pred_pt,
+            gt_fingerprint="b" * 64,
+            eval_split="test",
+            allow_legacy=False,
+        )
+
+
+def test_pilot_and_full_output_paths_are_isolated() -> None:
+    """A01: Pilot and Full training must never share any run, weight, or artifact output path."""
+    cfg = load_config()
+    ghe_mod = _load_src_module("ghe_a01", "02_ghe_ensemble.py")
+    yolo_mod = _load_src_module("yolo_a01", "03_train_infer_yolo.py")
+    frcnn_mod = _load_src_module("frcnn_a01", "04_train_infer_frcnn.py")
+    fusion_mod = _load_src_module("fusion_a01", "05_fusion.py")
+    eval_mod = _load_src_module("eval_a01", "06_evaluate.py")
+
+    def _collect_paths(run_id: str) -> set[Path]:
+        paths: set[Path] = set()
+        paths.add(ghe_mod.resolve_ghe_artifact_path(cfg, run_id, "standard_local_he"))
+        paths.update(yolo_mod.resolve_yolo_output_paths(cfg, run_id, "standard_local_he", "test", dummy=False))
+        paths.update(frcnn_mod.resolve_frcnn_output_paths(cfg, run_id, "standard_local_he", "test", dummy=False))
+        paths.update(fusion_mod.resolve_fusion_paths(cfg, run_id, "standard_local_he", "test"))
+        paths.update(eval_mod.resolve_eval_output_paths(cfg, run_id))
+        return paths
+
+    pilot_paths = _collect_paths("pilot")
+    full_paths = _collect_paths("full")
+    dummy_paths = _collect_paths("dummy")
+
+    assert pilot_paths.isdisjoint(full_paths), f"Overlap between pilot and full paths: {pilot_paths & full_paths}"
+    assert dummy_paths.isdisjoint(full_paths), f"Overlap between dummy and full paths: {dummy_paths & full_paths}"
+    assert dummy_paths.isdisjoint(pilot_paths), f"Overlap between dummy and pilot paths: {dummy_paths & pilot_paths}"
