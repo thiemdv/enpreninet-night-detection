@@ -10,13 +10,13 @@ predictions in the EnPreNiNet unified prediction schema:
         }
     }
 
-In `--dummy --device cpu` mode, executes 100% offline using a lightweight
-PyTorch detector for 1 batch/step on `data/dummy_processed/`, saving a dummy
-checkpoint and unified test predictions to `runs/dummy_yolo_<variant>/`.
+Saves a companion `.meta.json` sidecar containing `dataset_fingerprint`,
+`eval_split`, `image_variant`, and `yolo_repo_commit` (when applicable).
+Cleans stale YOLO dataset views and stale inference directories before each run.
 
 Usage:
     python src/03_train_infer_yolo.py --config configs/config.yaml --dummy --epochs 1 --device cpu
-    python src/03_train_infer_yolo.py --config configs/config.yaml --yolo-repo /path/to/yolov5 --image-variant standard_local_he
+    python src/03_train_infer_yolo.py --config configs/config.yaml --yolo-repo /content/yolov5 --image-variant standard_local_he
 """
 
 from __future__ import annotations
@@ -66,11 +66,32 @@ def resolve_variant_image(data_root: Path, image_variant: str, split: str, file_
     raise FileNotFoundError(f"Image '{file_name}' not found under {split_dir}")
 
 
-def load_coco_split_images(coco_json_path: Path) -> list[dict[str, Any]]:
+def load_coco_split_images(coco_json_path: Path) -> tuple[list[dict[str, Any]], str | None]:
     if not coco_json_path.is_file():
         raise FileNotFoundError(f"COCO split file not found: {coco_json_path}")
     data = json.loads(coco_json_path.read_text(encoding="utf-8"))
-    return list(data.get("images", []))
+    fp = (data.get("info") or {}).get("dataset_fingerprint")
+    return list(data.get("images", [])), (str(fp) if fp else None)
+
+
+def _read_git_commit(repo_dir: Path) -> str | None:
+    try:
+        res = subprocess.run(
+            ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return res.stdout.strip() or None
+    except Exception:
+        return None
+
+
+def save_prediction_meta(preds_path: Path, meta: dict[str, Any]) -> Path:
+    """Write sidecar metadata JSON next to prediction .pt file."""
+    meta_path = preds_path.with_name(f"{preds_path.name}.meta.json")
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return meta_path
 
 
 def empty_prediction() -> dict[str, torch.Tensor]:
@@ -88,10 +109,7 @@ def standardize_yolo_predictions(
     score_floor: float = 0.001,
     num_classes: int = 3,
 ) -> dict[str, torch.Tensor]:
-    """Convert raw YOLO detections [N, 6] (x1, y1, x2, y2, score, cls) into unified schema.
-
-    Handles None or empty (0, 6) inputs cleanly by returning empty (0, 4) / (0,) tensors.
-    """
+    """Convert raw YOLO detections [N, 6] (x1, y1, x2, y2, score, cls) into unified schema."""
     if raw_dets is None:
         return empty_prediction()
 
@@ -144,7 +162,6 @@ class DummyYoloDetector(nn.Module):
             nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool2d((1, 1)),
         )
-        # Per slot: 4 box params (cx, cy, w, h) + 1 objectness score + num_classes logits
         self.head = nn.Linear(16, max_dets * (5 + num_classes))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -157,9 +174,8 @@ def _read_image_tensor(img_path: Path, img_size: int) -> torch.Tensor:
     if img is None:
         raise RuntimeError(f"Failed to read image: {img_path}")
     if img.shape[:2] != (img_size, img_size):
-        img = cv2.resize(img, (img_size, img_size), interpolation=cv2.INTER_LINEAR)
-    tensor = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
-    return tensor
+        raise ValueError(f"Expected image shape ({img_size}, {img_size}), got {img.shape[:2]} for {img_path}")
+    return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
 
 
 def run_dummy_yolo(
@@ -180,12 +196,11 @@ def run_dummy_yolo(
     num_classes = len(cfg["dataset"]["classes"])
     coco_dir = data_root / cfg["paths"]["coco_subdir"]
 
-    train_images = load_coco_split_images(coco_dir / "instances_train.json")
-    eval_images = load_coco_split_images(coco_dir / f"instances_{eval_split}.json")
+    train_images, _ = load_coco_split_images(coco_dir / "instances_train.json")
+    eval_images, dataset_fp = load_coco_split_images(coco_dir / f"instances_{eval_split}.json")
     if not train_images:
         raise RuntimeError("No training images found in dummy dataset. Run F02/F03 first.")
 
-    # Load 1 small batch (up to 2 images) for fast 1-step offline training
     batch_tensors = [
         _read_image_tensor(resolve_variant_image(data_root, image_variant, "train", entry["file_name"]), img_size)
         for entry in train_images[:2]
@@ -199,12 +214,13 @@ def run_dummy_yolo(
     for _ in range(max(1, epochs)):
         optimizer.zero_grad()
         out = model(batch_x)
-        # Simple deterministic target for 1-step gradient check
         target = torch.zeros_like(out)
         target[..., 0:2] = 0.5
         target[..., 2:4] = 0.2
         target[..., 4] = 0.7
         loss = nn.functional.mse_loss(torch.sigmoid(out[..., :5]), target[..., :5])
+        if not torch.isfinite(loss):
+            raise RuntimeError(f"Non-finite dummy YOLO loss: {loss.item()}")
         loss.backward()
         optimizer.step()
 
@@ -218,6 +234,7 @@ def run_dummy_yolo(
             "image_variant": image_variant,
             "img_size": img_size,
             "num_classes": num_classes,
+            "dataset_fingerprint": dataset_fp,
             "dummy": True,
         },
         ckpt_path,
@@ -230,7 +247,7 @@ def run_dummy_yolo(
             img_id = int(entry["id"])
             img_path = resolve_variant_image(data_root, image_variant, eval_split, entry["file_name"])
             x = _read_image_tensor(img_path, img_size).unsqueeze(0).to(device)
-            raw_out = model(x)[0]  # (max_dets, 5 + num_classes)
+            raw_out = model(x)[0]
 
             cx = torch.sigmoid(raw_out[:, 0]) * float(img_size)
             cy = torch.sigmoid(raw_out[:, 1]) * float(img_size)
@@ -256,6 +273,18 @@ def run_dummy_yolo(
 
     preds_path = run_dir / f"yolo_{image_variant}_{eval_split}_preds.pt"
     torch.save(preds_by_image, preds_path)
+    save_prediction_meta(
+        preds_path,
+        {
+            "model": "dummy_yolo",
+            "image_variant": image_variant,
+            "eval_split": eval_split,
+            "score_floor": score_floor,
+            "dataset_fingerprint": dataset_fp,
+            "num_eval_images": len(preds_by_image),
+            "dummy": True,
+        },
+    )
     return ckpt_path, preds_path
 
 
@@ -265,28 +294,36 @@ def _prepare_yolo_view(
     image_variant: str,
     view_root: Path,
 ) -> Path:
-    """Create a YOLOv5-compatible dataset YAML + symlink/copy view preserving F02 splits."""
+    """Create a fresh YOLOv5-compatible dataset view strictly from current split manifests.
+
+    P0 fix: deletes stale view_root before rebuilding so outdated images/labels are never reused.
+    """
+    if view_root.exists():
+        shutil.rmtree(view_root)
+
+    splits_root = data_root / cfg["paths"]["splits_subdir"]
     yolo_labels_root = data_root / cfg["paths"]["yolo_subdir"]
+
     for split in ("train", "val", "test"):
-        src_img_dir = data_root / "images" / image_variant / split
-        src_lbl_dir = yolo_labels_root / split
+        manifest_path = splits_root / f"{split}.txt"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"Missing split manifest: {manifest_path}")
+
         dst_img_dir = view_root / "images" / split
         dst_lbl_dir = view_root / "labels" / split
         dst_img_dir.mkdir(parents=True, exist_ok=True)
         dst_lbl_dir.mkdir(parents=True, exist_ok=True)
 
-        if src_img_dir.is_dir():
-            for p in src_img_dir.iterdir():
-                if p.is_file():
-                    target = dst_img_dir / p.name
-                    if not target.exists():
-                        shutil.copy2(p, target)
-        if src_lbl_dir.is_dir():
-            for p in src_lbl_dir.iterdir():
-                if p.is_file():
-                    target = dst_lbl_dir / p.name
-                    if not target.exists():
-                        shutil.copy2(p, target)
+        entries = [ln.strip() for ln in manifest_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        for rel_entry in entries:
+            file_name = Path(rel_entry).name
+            stem = Path(file_name).stem
+            src_img = resolve_variant_image(data_root, image_variant, split, file_name)
+            src_lbl = yolo_labels_root / split / f"{stem}.txt"
+            if not src_lbl.is_file():
+                raise FileNotFoundError(f"Missing YOLO label for {file_name}: {src_lbl}")
+            shutil.copy2(src_img, dst_img_dir / src_img.name)
+            shutil.copy2(src_lbl, dst_lbl_dir / src_lbl.name)
 
     classes = {int(k): str(v) for k, v in cfg["dataset"]["classes"].items()}
     yaml_payload = {
@@ -341,6 +378,7 @@ def run_real_yolo(
     if not train_py.is_file() or not detect_py.is_file():
         raise FileNotFoundError(f"Expected train.py and detect.py inside --yolo-repo: {yolo_repo}")
 
+    seed = int(cfg["project"]["seed"])
     yolo_cfg = cfg["models"]["yolov5"]
     img_size = int(yolo_cfg["img_size"])
     num_classes = len(cfg["dataset"]["classes"])
@@ -348,8 +386,14 @@ def run_real_yolo(
 
     run_dir = resolve_path(cfg["paths"]["runs_dir"]) / f"yolo_{image_variant}"
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    # P0 fix: rebuild clean dataset view from current manifests
     view_root = run_dir / "yolo_view"
     dataset_yaml = _prepare_yolo_view(cfg, data_root, image_variant, view_root)
+
+    train_out_dir = run_dir / "train"
+    if train_out_dir.exists():
+        shutil.rmtree(train_out_dir)
 
     train_cmd = [
         sys.executable,
@@ -360,6 +404,8 @@ def run_real_yolo(
         str(batch_size),
         "--epochs",
         str(epochs),
+        "--seed",
+        str(seed),
         "--data",
         str(dataset_yaml),
         "--weights",
@@ -382,6 +428,11 @@ def run_real_yolo(
         shutil.copy2(best_pt, exported_weights)
     else:
         raise FileNotFoundError(f"YOLOv5 training finished without producing {best_pt}")
+
+    # P0 fix: remove stale inference directory before detect.py so old TXT files cannot be mixed/appended
+    infer_dir = run_dir / f"infer_{eval_split}"
+    if infer_dir.exists():
+        shutil.rmtree(infer_dir)
 
     eval_img_dir = view_root / "images" / eval_split
     detect_cmd = [
@@ -411,8 +462,8 @@ def run_real_yolo(
     subprocess.run(detect_cmd, check=True)
 
     coco_dir = data_root / cfg["paths"]["coco_subdir"]
-    eval_images = load_coco_split_images(coco_dir / f"instances_{eval_split}.json")
-    labels_out_dir = run_dir / f"infer_{eval_split}" / "labels"
+    eval_images, dataset_fp = load_coco_split_images(coco_dir / f"instances_{eval_split}.json")
+    labels_out_dir = infer_dir / "labels"
 
     preds_by_image: dict[int, dict[str, torch.Tensor]] = {}
     for entry in eval_images:
@@ -428,6 +479,20 @@ def run_real_yolo(
 
     preds_path = run_dir / f"yolo_{image_variant}_{eval_split}_preds.pt"
     torch.save(preds_by_image, preds_path)
+    save_prediction_meta(
+        preds_path,
+        {
+            "model": str(yolo_cfg["variant"]),
+            "image_variant": image_variant,
+            "eval_split": eval_split,
+            "score_floor": score_floor,
+            "seed": seed,
+            "dataset_fingerprint": dataset_fp,
+            "yolo_repo_commit": _read_git_commit(yolo_repo),
+            "num_eval_images": len(preds_by_image),
+            "dummy": False,
+        },
+    )
     return exported_weights, preds_path
 
 
@@ -447,6 +512,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default=None, help="Device: cpu, cuda, or auto")
     parser.add_argument("--score-floor", type=float, default=0.001, help="Minimum confidence score kept before fusion")
     parser.add_argument("--eval-split", type=str, choices=("val", "test"), default="test", help="Split to infer on")
+    parser.add_argument("--data-root", type=Path, default=None, help="Override processed data root directory")
     parser.add_argument("--dummy", action="store_true", help="Run offline CPU smoke test on data/dummy_processed")
     return parser.parse_args()
 
@@ -462,7 +528,7 @@ def main() -> None:
     device = select_device(args.device, cfg)
 
     if args.dummy:
-        data_root = resolve_path(cfg["paths"]["data_dummy_processed"])
+        data_root = args.data_root or resolve_path(cfg["paths"]["data_dummy_processed"])
         ckpt_path, preds_path = run_dummy_yolo(
             cfg=cfg,
             data_root=data_root,
@@ -475,7 +541,7 @@ def main() -> None:
     else:
         if args.yolo_repo is None:
             raise ValueError("--yolo-repo is required when running without --dummy")
-        data_root = resolve_path(cfg["paths"]["data_processed"])
+        data_root = args.data_root or resolve_path(cfg["paths"]["data_processed"])
         yolo_device = "cpu" if device.type == "cpu" else "0"
         ckpt_path, preds_path = run_real_yolo(
             cfg=cfg,

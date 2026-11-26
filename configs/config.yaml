@@ -68,7 +68,7 @@ models:
     pretrained: true
     num_classes: 4 # 3 target classes (1..3) + 1 background (0)
     img_size: 640
-    batch_size: 4
+    batch_size: 2 # Safer default for Colab T4 16GB GPU with ResNet-152 FPN
     epochs: 20
     learning_rate: 0.005
     momentum: 0.9

@@ -7,9 +7,10 @@ transformation modes:
   - fig4_normalized    [PROJECT]: PDF(x) = f(x) / W^2, s'(x) = round(H * C(x))
   - standard_local_he  [PROJECT]: PDF(x) = f(x) / W^2, s'(x) = round(255 * C(x))
 
-Reads resized raw images from <root>/images/raw/{train,val,test}/, writes
-lossless (640, 640, 3) PNG images to <root>/images/<method>/{train,val,test}/,
-and generates a visual comparison + histogram artifact in artifacts/.
+Reads split manifests from <root>/splits/{train,val,test}.txt, cleans stale
+outputs under <root>/images/<method>/, writes lossless (640, 640, 3) PNG images,
+records preprocessing metadata + timing in ghe_meta.json, and saves a visual
+comparison + histogram artifact in artifacts/.
 
 Usage:
     python src/02_ghe_ensemble.py --config configs/config.yaml --dummy
@@ -20,6 +21,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
+import time
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +64,8 @@ def build_gaussian_kernel(kernel_size: int = 3, sigma: float = 2.0) -> np.ndarra
     """Steps 4-7: Build normalized 2D Gaussian kernel of size k x k with std sigma."""
     if kernel_size < 1 or kernel_size % 2 == 0:
         raise ValueError(f"gaussian_kernel_size must be a positive odd integer, got {kernel_size}")
+    if sigma <= 0.0:
+        raise ValueError(f"gaussian_sigma must be > 0, got {sigma}")
     half = kernel_size // 2
     ax = np.arange(-half, half + 1, dtype=np.float64)
     xx, yy = np.meshgrid(ax, ax)
@@ -98,6 +103,8 @@ def sliding_window_ghe(
     """Steps 9-15 (core): Vectorized row-chunked W x W sliding-window histogram equalization."""
     if window_size < 3 or window_size % 2 == 0:
         raise ValueError(f"window_size must be an odd integer >= 3, got {window_size}")
+    if chunk_rows <= 0:
+        raise ValueError(f"chunk_rows must be > 0, got {chunk_rows}")
     if method not in VALID_METHODS:
         raise ValueError(f"Unsupported method {method!r}; expected one of {VALID_METHODS}")
     if border_mode not in NP_PAD_MODE_MAP:
@@ -120,9 +127,8 @@ def sliding_window_ghe(
 
     for r0 in range(0, height, chunk_rows):
         r1 = min(r0 + chunk_rows, height)
-        # Extract padded strip covering rows [r0, r1) with full W x W vertical context
         strip = padded[r0 : r1 + 2 * pad, :]
-        # Zero-copy view: shape (chunk_h, width, W, W) -> (chunk_h, width, W*W)
+        # sliding_window_view is zero-copy; reshape may materialize chunk-sized buffer
         windows = sliding_window_view(strip, (window_size, window_size))
         windows_flat = windows.reshape(r1 - r0, width, window_size * window_size)
 
@@ -169,10 +175,7 @@ def ghe_ensemble(
     uniform_window_policy: str = "identity",
     chunk_rows: int = 32,
 ) -> np.ndarray:
-    """Full 15-step GHE Ensemble pipeline returning a (H, W, 3) uint8 image with identical channels.
-
-    Set image_size=None to keep the input spatial dimensions (useful for unit tests).
-    """
+    """Full 15-step GHE Ensemble pipeline returning a (H, W, 3) uint8 image with identical channels."""
     if image.ndim == 3:
         if image_size is not None and (image.shape[0] != image_size or image.shape[1] != image_size):
             image = cv2.resize(image, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
@@ -258,6 +261,15 @@ def save_comparison_artifact(
     plt.close(fig)
 
 
+def _read_dataset_fingerprint(data_root: Path) -> str | None:
+    meta_path = data_root / "dataset_meta.json"
+    if not meta_path.is_file():
+        return None
+    data = json.loads(meta_path.read_text(encoding="utf-8"))
+    fp = data.get("dataset_fingerprint")
+    return str(fp) if fp else None
+
+
 def process_dataset(
     cfg: dict[str, Any],
     data_root: Path,
@@ -269,43 +281,48 @@ def process_dataset(
     chunk_rows: int,
     artifact_path: Path,
 ) -> dict[str, Any]:
-    """Process all splits from images/raw/{train,val,test} into images/<method>/{train,val,test}."""
+    """Read split manifests from splits/*.txt, clean images/<method>/, and write GHE PNGs + ghe_meta.json."""
     ghe_cfg = cfg["preprocessing"]["ghe_ensemble"]
     image_size = int(ghe_cfg["image_size"])
     k_size = int(ghe_cfg["gaussian_kernel_size"])
     sigma = float(ghe_cfg["gaussian_sigma"])
 
-    raw_root = data_root / cfg["paths"]["images_raw_subdir"]
+    splits_root = data_root / cfg["paths"]["splits_subdir"]
     out_root = data_root / cfg["paths"]["ghe_images_root"] / method
 
-    if not raw_root.is_dir():
+    if not splits_root.is_dir():
         raise FileNotFoundError(
-            f"Raw resized images directory not found: {raw_root}. Run src/01_prepare_bdd.py first."
+            f"Split manifests directory not found: {splits_root}. Run src/01_prepare_bdd.py first."
         )
 
-    stats: dict[str, Any] = {
-        "method": method,
-        "window_size": window_size,
-        "output_root": str(out_root),
-        "splits": {},
-        "artifact": str(artifact_path),
-    }
+    # Clean stale outputs for this method before writing fresh PNGs
+    if out_root.exists():
+        shutil.rmtree(out_root)
+    out_root.mkdir(parents=True, exist_ok=True)
 
+    dataset_fingerprint = _read_dataset_fingerprint(data_root)
+    t0 = time.perf_counter()
+    total_images = 0
+    split_counts: dict[str, int] = {}
     sample_img: np.ndarray | None = None
+
     for split_name in ("train", "val", "test"):
-        split_in = raw_root / split_name
+        manifest_path = splits_root / f"{split_name}.txt"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"Missing split manifest: {manifest_path}")
+
         split_out = out_root / split_name
         split_out.mkdir(parents=True, exist_ok=True)
 
-        img_paths = sorted(
-            p for p in split_in.iterdir() if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"}
-        ) if split_in.is_dir() else []
-
+        manifest_entries = [
+            ln.strip() for ln in manifest_path.read_text(encoding="utf-8").splitlines() if ln.strip()
+        ]
         count = 0
-        for img_path in img_paths:
+        for rel_path in manifest_entries:
+            img_path = data_root / Path(rel_path)
             img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
             if img is None:
-                raise RuntimeError(f"Failed to read image: {img_path}")
+                raise RuntimeError(f"Failed to read image listed in {manifest_path}: {img_path}")
             if sample_img is None:
                 sample_img = img
 
@@ -322,10 +339,15 @@ def process_dataset(
                 chunk_rows=chunk_rows,
             )
             dst_path = split_out / f"{img_path.stem}.png"
-            cv2.imwrite(str(dst_path), ghe_img)
+            if not cv2.imwrite(str(dst_path), ghe_img):
+                raise IOError(f"cv2.imwrite failed for {dst_path}")
             count += 1
+            total_images += 1
 
-        stats["splits"][split_name] = count
+        split_counts[split_name] = count
+
+    elapsed_sec = time.perf_counter() - t0
+    ms_per_image = (elapsed_sec * 1000.0 / total_images) if total_images > 0 else 0.0
 
     if sample_img is not None:
         save_comparison_artifact(
@@ -341,6 +363,25 @@ def process_dataset(
             chunk_rows=chunk_rows,
         )
 
+    stats: dict[str, Any] = {
+        "method": method,
+        "image_size": image_size,
+        "gaussian_kernel_size": k_size,
+        "gaussian_sigma": sigma,
+        "window_size": window_size,
+        "border_mode": border_mode,
+        "zero_division_policy": zero_division_policy,
+        "uniform_window_policy": uniform_window_policy,
+        "chunk_rows": chunk_rows,
+        "dataset_fingerprint": dataset_fingerprint,
+        "total_images": total_images,
+        "elapsed_seconds": round(elapsed_sec, 4),
+        "ms_per_image": round(ms_per_image, 2),
+        "output_root": str(out_root),
+        "splits": split_counts,
+        "artifact": str(artifact_path),
+    }
+    (out_root / "ghe_meta.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
     return stats
 
 

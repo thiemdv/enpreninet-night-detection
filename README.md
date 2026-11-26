@@ -106,12 +106,18 @@ Các chỉ số đánh giá được sử dụng trong nghiên cứu bao gồm *
 | **F08** | `notebooks/Colab_Runner.ipynb` | Notebook điều phối mỏng chạy ma trận thực nghiệm **E0–E5** trên Google Colab & lưu Google Drive |
 
 **Ma trận thực nghiệm (E0–E5):**
-- **E0:** Baseline YOLOv5l trên ảnh ban đêm gốc (chưa GHE).
-- **E1:** GHE-YOLOv5l (so sánh các chế độ GHE Ensemble).
-- **E2:** Baseline Faster R-CNN ResNet-152 trên ảnh ban đêm gốc.
-- **E3:** GHE-Faster R-CNN ResNet-152.
+- **GPU Pilot (Khuyến nghị trước full training):** 200 ảnh ban đêm thật, 2 epochs để kiểm chứng bộ nhớ GPU T4 (`batch_size=2` cho Faster R-CNN ResNet-152), loss hữu hạn, `dataset_fingerprint` và đường ống E0–E5 đầu cuối.
+- **E0:** Baseline YOLOv5l (`v7.0`, COCO pretrained) trên ảnh ban đêm gốc (chưa GHE).
+- **E1:** GHE-YOLOv5l trên ảnh `standard_local_he` (hỗ trợ đối chứng mở rộng với `fig4_literal` & `fig4_normalized`).
+- **E2:** Baseline Faster R-CNN ResNet-152 (ImageNet-pretrained backbone + detection head khởi tạo mới) trên ảnh ban đêm gốc.
+- **E3:** GHE-Faster R-CNN ResNet-152 trên ảnh `standard_local_he`.
 - **E4:** EnPreNiNet Fusion (không dùng Global NMS — ablation `global_nms_enabled: false`).
 - **E5:** **EnPreNiNet Full** (GHE Ensemble + YOLOv5l + Faster R-CNN ResNet-152 + Global NMS tại `tau in {0.25, 0.50, 0.75}`).
+
+> **Ghi chú học thuật & Giới hạn triển khai:**
+> - Bộ tiền xử lý GHE tái hiện thuật toán 15 bước tại **Hình 4** của bài báo (`standard_local_he` làm cấu hình chính, `fig4_literal`/`fig4_normalized` làm đối chứng), không bao gồm các nhánh mở rộng của Hình 6.
+> - Bộ đánh giá `src/06_evaluate.py` sử dụng quy ước khớp 1-1 kiểu **Pascal VOC** (greedy best-IoU) kết hợp nội suy PR toàn điểm (**all-point AP@50/AP@75**, loại lớp có `0` GT khỏi trung bình `mAP`), khác với COCO 101-point mAP@[.50:.95].
+> - Khi huấn luyện thật, `YOLOv5l` khởi tạo từ trọng số detector pretrained COCO trong khi `Faster R-CNN` khởi tạo từ backbone `ResNet-152` pretrained ImageNet; sự khác biệt khởi tạo này cần được ghi nhận khi phân tích kết quả thực nghiệm.
 
 ---
 

@@ -1,20 +1,25 @@
 """F02: BDD100K Night Filter & Dual-Format Exporter (YOLO + COCO).
 
-Filters BDD100K frames where timeofday == 'night' (retaining negative samples),
-maps target classes {car: 0, person: 1, traffic light: 2}, splits 70/20/10
-deterministically, resizes images to 640x640 into images/raw/{train,val,test}/,
-and exports split manifests, YOLO .txt labels, and COCO instances_*.json.
+Filters BDD100K frames where timeofday == 'night', distinguishes unannotated
+frames (labels is None, skipped by default) from valid negative samples
+(labels == [] or 0 target objects, retained), maps target classes
+{car: 0, person: 1, traffic light: 2}, deterministically sorts & splits 70/20/10,
+cleans stale output directories before writing, resizes images to 640x640 into
+images/raw/{train,val,test}/, and exports split manifests, dataset_meta.json
+(with SHA-256 dataset_fingerprint), YOLO .txt labels, and COCO instances_*.json.
 
 Usage:
     python src/01_prepare_bdd.py --config configs/config.yaml --dummy
-    python src/01_prepare_bdd.py --config configs/config.yaml --raw-dir data/raw
+    python src/01_prepare_bdd.py --config configs/config.yaml --raw-dir /content/raw_bdd/bdd100k
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -35,13 +40,35 @@ def resolve_path(path_str: str) -> Path:
     return p if p.is_absolute() else (REPO_ROOT / p)
 
 
+def _write_image_checked(dst_path: Path, img: np.ndarray) -> None:
+    ok = cv2.imwrite(str(dst_path), img)
+    if not ok:
+        raise IOError(f"cv2.imwrite failed for {dst_path}")
+
+
+def compute_dataset_fingerprint(
+    manifest_by_split: dict[str, list[str]],
+    seed: int,
+    img_size: int,
+) -> str:
+    """Compute a deterministic SHA-256 fingerprint from split manifests, seed, and img_size."""
+    hasher = hashlib.sha256()
+    hasher.update(f"seed={seed}|img_size={img_size}\n".encode("utf-8"))
+    for split_name in ("train", "val", "test"):
+        hasher.update(f"[{split_name}]\n".encode("utf-8"))
+        for entry in manifest_by_split.get(split_name, []):
+            hasher.update(f"{entry}\n".encode("utf-8"))
+    return hasher.hexdigest()
+
+
 def generate_dummy_bdd_dataset(dummy_dir: Path, seed: int = 42) -> Path:
-    """Create a realistic 12-frame BDD100K-schema dummy dataset under data/dummy/.
+    """Create a 13-frame BDD100K-schema dummy dataset under data/dummy/.
 
     Includes:
-    - 10 night frames (1280x720): 8 with target box2d + poly2d + out-of-scope classes,
-      1 with labels=None (negative sample), 1 with only out-of-scope/poly2d (negative sample).
-    - 2 daytime frames (1280x720) that must be filtered out.
+    - 8 positive night frames (1280x720) with target box2d + poly2d + out-of-scope classes.
+    - 2 valid negative night frames: night_08.jpg (labels=[]) and night_09.jpg (only out-of-scope/poly2d).
+    - 1 unannotated night frame: night_unannotated_10.jpg (labels=None, skipped by default).
+    - 2 daytime frames (day_00.jpg, day_01.jpg, filtered out).
     """
     images_dir = dummy_dir / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
@@ -54,15 +81,13 @@ def generate_dummy_bdd_dataset(dummy_dir: Path, seed: int = 42) -> Path:
     def _make_image(name: str, is_night: bool) -> None:
         img_path = images_dir / name
         if is_night:
-            # Low-light synthetic night frame with slight road/headlight structure
             img = rng.integers(5, 45, size=(height, width, 3), dtype=np.uint8)
             cv2.rectangle(img, (200, 320), (420, 480), (90, 95, 110), -1)
             cv2.circle(img, (900, 140), 18, (60, 190, 220), -1)
         else:
             img = rng.integers(120, 220, size=(height, width, 3), dtype=np.uint8)
-        cv2.imwrite(str(img_path), img)
+        _write_image_checked(img_path, img)
 
-    # 8 positive night frames (with target classes + poly2d + out-of-scope classes)
     for idx in range(8):
         name = f"night_{idx:02d}.jpg"
         _make_image(name, is_night=True)
@@ -97,13 +122,11 @@ def generate_dummy_bdd_dataset(dummy_dir: Path, seed: int = 42) -> Path:
                     "y2": 180.0,
                 },
             },
-            # Out-of-scope box2d class (must be ignored)
             {
                 "id": idx * 10 + 4,
                 "category": "truck",
                 "box2d": {"x1": 60.0, "y1": 220.0, "x2": 260.0, "y2": 460.0},
             },
-            # poly2d annotation without box2d (must be ignored)
             {
                 "id": idx * 10 + 5,
                 "category": "drivable area",
@@ -124,17 +147,17 @@ def generate_dummy_bdd_dataset(dummy_dir: Path, seed: int = 42) -> Path:
             }
         )
 
-    # Night frame 8: labels=None (negative sample)
+    # Night frame 8: explicitly annotated as empty list [] (valid negative sample)
     _make_image("night_08.jpg", is_night=True)
     frames.append(
         {
             "name": "night_08.jpg",
             "attributes": {"weather": "clear", "scene": "highway", "timeofday": "night"},
-            "labels": None,
+            "labels": [],
         }
     )
 
-    # Night frame 9: only out-of-scope class + poly2d (0 target objects -> negative sample)
+    # Night frame 9: only out-of-scope class + poly2d (valid negative sample with 0 target objects)
     _make_image("night_09.jpg", is_night=True)
     frames.append(
         {
@@ -152,6 +175,16 @@ def generate_dummy_bdd_dataset(dummy_dir: Path, seed: int = 42) -> Path:
                     "poly2d": [{"vertices": [[200.0, 720.0], [600.0, 400.0]], "types": "LL", "closed": False}],
                 },
             ],
+        }
+    )
+
+    # Unannotated night frame (labels=None): skipped by default unless --include-null-labels
+    _make_image("night_unannotated_10.jpg", is_night=True)
+    frames.append(
+        {
+            "name": "night_unannotated_10.jpg",
+            "attributes": {"weather": "clear", "scene": "highway", "timeofday": "night"},
+            "labels": None,
         }
     )
 
@@ -180,12 +213,16 @@ def generate_dummy_bdd_dataset(dummy_dir: Path, seed: int = 42) -> Path:
 
 
 def find_image_file(raw_dir: Path, image_name: str) -> Path:
-    """Locate an image inside raw_dir (supports flat or nested images/ subdirectories)."""
+    """Locate an image inside raw_dir across standard BDD100K unzipped layouts."""
     candidates = [
         raw_dir / "images" / image_name,
         raw_dir / image_name,
         raw_dir / "images" / "100k" / "train" / image_name,
         raw_dir / "images" / "100k" / "val" / image_name,
+        raw_dir / "images" / "100k" / "test" / image_name,
+        raw_dir / "bdd100k" / "images" / "100k" / "train" / image_name,
+        raw_dir / "bdd100k" / "images" / "100k" / "val" / image_name,
+        raw_dir / "bdd100k" / "images" / "100k" / "test" / image_name,
     ]
     for cand in candidates:
         if cand.is_file():
@@ -199,19 +236,35 @@ def split_frames(
     val_ratio: float,
     seed: int,
 ) -> dict[str, list[dict[str, Any]]]:
-    """Deterministically shuffle and split frames into train / val / test."""
-    shuffled = list(frames)
-    random.Random(seed).shuffle(shuffled)
-    n = len(shuffled)
+    """Validate unique frame names, sort deterministically, then shuffle & split train/val/test."""
+    names = [str(fr["name"]) for fr in frames]
+    if len(names) != len(set(names)):
+        seen: set[str] = set()
+        dups = sorted({nm for nm in names if nm in seen or seen.add(nm)})
+        raise ValueError(f"Duplicate frame names detected in BDD labels: {dups[:5]}")
+
+    # Sort by frame name before shuffling so split reproducibility is independent of JSON order
+    ordered = sorted(frames, key=lambda fr: str(fr["name"]))
+    random.Random(seed).shuffle(ordered)
+
+    n = len(ordered)
     n_train = int(round(n * train_ratio))
     n_val = int(round(n * val_ratio))
     if n_train + n_val > n:
         n_val = max(0, n - n_train)
     return {
-        "train": shuffled[:n_train],
-        "val": shuffled[n_train : n_train + n_val],
-        "test": shuffled[n_train + n_val :],
+        "train": ordered[:n_train],
+        "val": ordered[n_train : n_train + n_val],
+        "test": ordered[n_train + n_val :],
     }
+
+
+def _clean_output_subdirs(out_dir: Path, subdirs: tuple[Path, ...]) -> None:
+    """Remove stale generated subdirectories before re-preparing dataset splits."""
+    for sub in subdirs:
+        target = out_dir / sub
+        if target.exists():
+            shutil.rmtree(target)
 
 
 def prepare_bdd_dataset(
@@ -221,8 +274,10 @@ def prepare_bdd_dataset(
     out_dir: Path,
     seed: int,
     img_size: int,
+    include_null_labels: bool = False,
+    max_images: int | None = None,
 ) -> dict[str, Any]:
-    """Filter night frames, split 70/20/10, resize to 640x640, and export YOLO + COCO."""
+    """Filter night frames, split 70/20/10, resize to 640x640, and export YOLO + COCO cleanly."""
     target_timeofday: str = cfg["dataset"]["timeofday"]
     class_mapping: dict[str, int] = cfg["dataset"]["bdd_class_mapping"]
     classes_dict: dict[int, str] = {int(k): str(v) for k, v in cfg["dataset"]["classes"].items()}
@@ -236,29 +291,57 @@ def prepare_bdd_dataset(
     with labels_json.open("r", encoding="utf-8") as f:
         all_frames: list[dict[str, Any]] = json.load(f)
 
-    night_frames = [
+    night_candidates = [
         fr for fr in all_frames if (fr.get("attributes") or {}).get("timeofday") == target_timeofday
     ]
-    filtered_out = len(all_frames) - len(night_frames)
+    filtered_out_non_night = len(all_frames) - len(night_candidates)
+
+    skipped_null_labels = 0
+    valid_night_frames: list[dict[str, Any]] = []
+    for fr in night_candidates:
+        if fr.get("labels") is None and not include_null_labels:
+            skipped_null_labels += 1
+            continue
+        valid_night_frames.append(fr)
+
+    # Deterministic cap for pilot experiments (sort by name before capping)
+    if max_images is not None and max_images > 0 and len(valid_night_frames) > max_images:
+        valid_night_frames = sorted(valid_night_frames, key=lambda fr: str(fr["name"]))[:max_images]
 
     split_map = split_frames(
-        night_frames,
+        valid_night_frames,
         train_ratio=float(splits_cfg["train"]),
         val_ratio=float(splits_cfg["val"]),
         seed=seed,
     )
+
+    # P0 fix: clean stale files from previous runs before writing fresh split outputs
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _clean_output_subdirs(out_dir, (images_raw_subdir, splits_subdir, yolo_subdir, coco_subdir))
 
     coco_categories = [
         {"id": cls_id, "name": cls_name, "supercategory": "object"}
         for cls_id, cls_name in sorted(classes_dict.items())
     ]
 
+    # Pre-build manifests & dataset_fingerprint so COCO info embeds the exact fingerprint
+    manifest_by_split: dict[str, list[str]] = {
+        split_name: [(images_raw_subdir / split_name / fr["name"]).as_posix() for fr in split_map[split_name]]
+        for split_name in ("train", "val", "test")
+    }
+    dataset_fingerprint = compute_dataset_fingerprint(manifest_by_split, seed=seed, img_size=img_size)
+
     global_image_id = 1
     global_ann_id = 1
     stats: dict[str, Any] = {
         "total_input_frames": len(all_frames),
-        "night_frames": len(night_frames),
-        "filtered_out_frames": filtered_out,
+        "night_frames": len(valid_night_frames),
+        "filtered_out_frames": filtered_out_non_night,
+        "skipped_null_labels": skipped_null_labels,
+        "include_null_labels": include_null_labels,
+        "seed": seed,
+        "img_size": img_size,
+        "dataset_fingerprint": dataset_fingerprint,
         "splits": {},
         "negative_samples": 0,
         "class_counts": {cls_id: 0 for cls_id in sorted(classes_dict.keys())},
@@ -274,7 +357,6 @@ def prepare_bdd_dataset(
         split_img_dir.mkdir(parents=True, exist_ok=True)
         split_yolo_dir.mkdir(parents=True, exist_ok=True)
 
-        manifest_lines: list[str] = []
         coco_images: list[dict[str, Any]] = []
         coco_annotations: list[dict[str, Any]] = []
 
@@ -289,10 +371,7 @@ def prepare_bdd_dataset(
             resized = cv2.resize(img, (img_size, img_size), interpolation=cv2.INTER_LINEAR)
 
             dst_img_path = split_img_dir / img_name
-            cv2.imwrite(str(dst_img_path), resized)
-
-            rel_manifest_path = (images_raw_subdir / split_name / img_name).as_posix()
-            manifest_lines.append(rel_manifest_path)
+            _write_image_checked(dst_img_path, resized)
 
             img_id = global_image_id
             global_image_id += 1
@@ -336,7 +415,6 @@ def prepare_bdd_dataset(
                 cls_id = int(class_mapping[category])
                 stats["class_counts"][cls_id] += 1
 
-                # Compute exact-bounded normalized coordinates so cx +/- wn/2 stays inside [0, 1]
                 x1_n = round(x1_s / img_size, 6)
                 y1_n = round(y1_s / img_size, 6)
                 x2_n = round(x2_s / img_size, 6)
@@ -367,11 +445,17 @@ def prepare_bdd_dataset(
             yolo_txt_path = split_yolo_dir / f"{Path(img_name).stem}.txt"
             yolo_txt_path.write_text("\n".join(yolo_lines) + ("\n" if yolo_lines else ""), encoding="utf-8")
 
+        manifest_lines = manifest_by_split[split_name]
         manifest_path = out_dir / splits_subdir / f"{split_name}.txt"
         manifest_path.write_text("\n".join(manifest_lines) + ("\n" if manifest_lines else ""), encoding="utf-8")
 
         coco_payload = {
-            "info": {"description": f"EnPreNiNet BDD100K Night ({split_name})", "version": "2.1"},
+            "info": {
+                "description": f"EnPreNiNet BDD100K Night ({split_name})",
+                "version": "2.1",
+                "dataset_fingerprint": dataset_fingerprint,
+                "seed": seed,
+            },
             "images": coco_images,
             "annotations": coco_annotations,
             "categories": coco_categories,
@@ -385,6 +469,8 @@ def prepare_bdd_dataset(
             "annotations": len(coco_annotations),
         }
 
+    meta_path = out_dir / "dataset_meta.json"
+    meta_path.write_text(json.dumps(stats, indent=2), encoding="utf-8")
     return stats
 
 
@@ -397,6 +483,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, default=None, help="Override output directory")
     parser.add_argument("--seed", type=int, default=None, help="Override random seed")
     parser.add_argument("--img-size", type=int, default=None, help="Override target image size")
+    parser.add_argument(
+        "--include-null-labels",
+        action="store_true",
+        default=False,
+        help="Include frames where labels is None (default False: skip unannotated frames)",
+    )
+    parser.add_argument(
+        "--max-images",
+        type=int,
+        default=None,
+        help="Optional cap on valid night frames (useful for GPU pilot runs)",
+    )
     return parser.parse_args()
 
 
@@ -412,8 +510,8 @@ def main() -> None:
         raw_dir = args.raw_dir or resolve_path(cfg["paths"]["data_dummy"])
         out_dir = args.out_dir or resolve_path(cfg["paths"]["data_dummy_processed"])
         labels_json = args.labels_json or (raw_dir / "labels_dummy.json")
-        if not labels_json.is_file():
-            generate_dummy_bdd_dataset(raw_dir, seed=seed)
+        # Regenerate dummy dataset to keep schema aligned with latest unannotated-vs-negative fixtures
+        generate_dummy_bdd_dataset(raw_dir, seed=seed)
     else:
         raw_dir = args.raw_dir or resolve_path(cfg["paths"]["data_raw"])
         out_dir = args.out_dir or resolve_path(cfg["paths"]["data_processed"])
@@ -428,6 +526,8 @@ def main() -> None:
         out_dir=out_dir,
         seed=seed,
         img_size=img_size,
+        include_null_labels=args.include_null_labels,
+        max_images=args.max_images,
     )
     print(f"[01_prepare_bdd] Completed ({'dummy' if args.dummy else 'full'}) -> {out_dir}")
     print(json.dumps(stats, indent=2))

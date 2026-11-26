@@ -2,14 +2,15 @@
 
 Computes Precision, Recall, F1-Score (per-class, micro, macro) across
 confidence thresholds [0.25, 0.50, 0.75] and AP@50/mAP@50, AP@75/mAP@75
-(all-point PR interpolation) across evaluation IoU thresholds [0.50, 0.75].
+using Pascal VOC greedy best-IoU 1-to-1 matching with all-point PR interpolation
+(excluding 0-GT classes from mAP mean).
 
-Exports a detailed JSON metrics report and a Markdown ablation comparison table
-to artifacts/.
+Enforces strict image_id set equality (`set(preds) == set(gt)`) and verifies
+`dataset_fingerprint` consistency between prediction sidecar metadata and COCO GT.
 
 Usage:
     python src/06_evaluate.py --config configs/config.yaml --dummy --device cpu
-    python src/06_evaluate.py --config configs/config.yaml --preds E0=runs/yolo_raw/yolo_raw_test_preds.pt E5=runs/fusion_standard_local_he/fusion_standard_local_he_test_preds.pt
+    python src/06_evaluate.py --config configs/config.yaml --preds E0=runs/yolo_raw/yolo_raw_test_preds.pt E5=runs/fusion_standard_local_he/fusion_standard_local_he_e5_full_test_preds.pt
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VALID_IMAGE_VARIANTS = ("raw", "fig4_literal", "fig4_normalized", "standard_local_he")
+MATCHING_PROTOCOL = "pascal_voc_greedy_best_iou_all_point_ap"
 
 
 def load_config(config_path: Path) -> dict[str, Any]:
@@ -37,6 +39,13 @@ def resolve_path(path_str: str) -> Path:
     return p if p.is_absolute() else (REPO_ROOT / p)
 
 
+def read_prediction_meta(preds_path: Path) -> dict[str, Any] | None:
+    meta_path = preds_path.with_name(f"{preds_path.name}.meta.json")
+    if not meta_path.is_file():
+        return None
+    return json.loads(meta_path.read_text(encoding="utf-8"))
+
+
 def compute_iou_matrix(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
     """Compute pairwise IoU matrix of shape (M, K) for xyxy boxes1 (M, 4) and boxes2 (K, 4)."""
     b1 = torch.as_tensor(boxes1, dtype=torch.float32)
@@ -46,8 +55,8 @@ def compute_iou_matrix(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tens
     if m == 0 or k == 0:
         return torch.zeros((m, k), dtype=torch.float32)
 
-    lt = torch.maximum(b1[:, None, :2], b2[None, :, :2])  # (M, K, 2)
-    rb = torch.minimum(b1[:, None, 2:], b2[None, :, 2:])  # (M, K, 2)
+    lt = torch.maximum(b1[:, None, :2], b2[None, :, :2])
+    rb = torch.minimum(b1[:, None, 2:], b2[None, :, 2:])
     wh = (rb - lt).clamp(min=0.0)
     inter = wh[:, :, 0] * wh[:, :, 1]
 
@@ -78,15 +87,15 @@ def _match_class_detections(
     iou_threshold: float,
     conf_threshold: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, int]:
-    """Greedy 1-to-1 matching for a single class at given IoU and confidence thresholds."""
-    all_image_ids = sorted(set(gt_by_image.keys()) | set(preds_by_image.keys()))
+    """Pascal VOC greedy best-IoU 1-to-1 matching for a single class at given IoU & confidence thresholds."""
+    all_image_ids = sorted(gt_by_image.keys())
 
     gt_boxes_map: dict[int, torch.Tensor] = {}
     gt_matched_map: dict[int, list[bool]] = {}
     total_gt = 0
     for img_id in all_image_ids:
-        gt = gt_by_image.get(img_id)
-        if gt is not None and gt["boxes"].numel() > 0:
+        gt = gt_by_image[img_id]
+        if gt["boxes"].numel() > 0:
             mask = gt["labels"].to(torch.long) == class_id
             cls_boxes = gt["boxes"][mask].detach().cpu().to(torch.float32)
         else:
@@ -95,11 +104,10 @@ def _match_class_detections(
         gt_matched_map[img_id] = [False] * int(cls_boxes.shape[0])
         total_gt += int(cls_boxes.shape[0])
 
-    # Gather all class predictions across images and sort globally by score descending
     det_records: list[tuple[float, int, torch.Tensor]] = []
     for img_id in all_image_ids:
-        pred = preds_by_image.get(img_id)
-        if pred is None or pred["boxes"].numel() == 0:
+        pred = preds_by_image[img_id]
+        if pred["boxes"].numel() == 0:
             continue
         boxes = pred["boxes"].detach().cpu().to(torch.float32)
         scores = pred["scores"].detach().cpu().to(torch.float32)
@@ -146,12 +154,23 @@ def evaluate_predictions(
     class_names: dict[int, str],
     iou_thresholds: list[float] | tuple[float, ...] = (0.50, 0.75),
     conf_thresholds: list[float] | tuple[float, ...] = (0.25, 0.50, 0.75),
+    strict_image_ids: bool = True,
 ) -> dict[str, Any]:
     """Evaluate unified predictions against ground truth across IoU and confidence thresholds.
 
-    Pure computation function (no file I/O). Safely handles empty predictions and
-    classes with 0 GT instances (excluded from mAP average rather than producing NaN).
+    P0 fix: enforces strict set(preds_by_image) == set(gt_by_image) when strict_image_ids=True.
+    Uses Pascal VOC greedy best-IoU 1-to-1 matching + all-point PR interpolation.
     """
+    pred_ids = set(preds_by_image.keys())
+    gt_ids = set(gt_by_image.keys())
+    if strict_image_ids and pred_ids != gt_ids:
+        missing_in_preds = sorted(gt_ids - pred_ids)
+        extra_in_preds = sorted(pred_ids - gt_ids)
+        raise ValueError(
+            f"Prediction image_ids do not match GT image_ids! "
+            f"missing_in_preds={missing_in_preds[:5]}, extra_in_preds={extra_in_preds[:5]}"
+        )
+
     sorted_classes = sorted((int(cid), str(cname)) for cid, cname in class_names.items())
     ap_by_iou: dict[str, Any] = {}
     operating_points: dict[str, Any] = {}
@@ -183,7 +202,6 @@ def evaluate_predictions(
         map_val = float(np.mean(valid_aps)) if valid_aps else 0.0
         ap_by_iou[iou_key] = {"map": map_val, "per_class": per_class_ap}
 
-        # Precision, Recall, F1 at each confidence threshold
         op_for_iou: dict[str, Any] = {}
         for conf_thr in conf_thresholds:
             conf_key = f"{float(conf_thr):.2f}"
@@ -248,12 +266,12 @@ def evaluate_predictions(
             }
         operating_points[iou_key] = op_for_iou
 
-    # Top-level summary metrics (default operating point: IoU=0.50, conf=first threshold e.g. 0.25)
     primary_iou = "0.50" if "0.50" in operating_points else next(iter(operating_points.keys()))
     primary_conf = "0.25" if "0.25" in operating_points[primary_iou] else next(iter(operating_points[primary_iou].keys()))
     primary_micro = operating_points[primary_iou][primary_conf]["micro"]
 
     return {
+        "matching_protocol": MATCHING_PROTOCOL,
         "precision": float(primary_micro["precision"]),
         "recall": float(primary_micro["recall"]),
         "f1": float(primary_micro["f1"]),
@@ -264,11 +282,12 @@ def evaluate_predictions(
     }
 
 
-def load_coco_ground_truth(coco_json_path: Path) -> dict[int, dict[str, torch.Tensor]]:
-    """Load COCO instances_*.json into {image_id: {'boxes': xyxy, 'labels': 0..2}}."""
+def load_coco_ground_truth(coco_json_path: Path) -> tuple[dict[int, dict[str, torch.Tensor]], str | None]:
+    """Load COCO instances_*.json into ({image_id: {'boxes': xyxy, 'labels': 0..2}}, dataset_fingerprint)."""
     if not coco_json_path.is_file():
         raise FileNotFoundError(f"Ground truth COCO JSON not found: {coco_json_path}")
     data = json.loads(coco_json_path.read_text(encoding="utf-8"))
+    fp = (data.get("info") or {}).get("dataset_fingerprint")
 
     boxes_by_img: dict[int, list[list[float]]] = {int(img["id"]): [] for img in data.get("images", [])}
     labels_by_img: dict[int, list[int]] = {int(img["id"]): [] for img in data.get("images", [])}
@@ -295,13 +314,16 @@ def load_coco_ground_truth(coco_json_path: Path) -> dict[int, dict[str, torch.Te
                 "boxes": torch.empty((0, 4), dtype=torch.float32),
                 "labels": torch.empty((0,), dtype=torch.long),
             }
-    return gt_by_image
+    return gt_by_image, (str(fp) if fp else None)
 
 
 def format_ablation_markdown(report: dict[str, Any]) -> str:
     """Format model evaluation results into a clean Markdown comparison table."""
     lines = [
         f"# EnPreNiNet Evaluation & Ablation Summary ({report['mode']} | split={report['eval_split']})",
+        "",
+        f"> **Protocol:** `{report['matching_protocol']}` (Pascal VOC greedy best-IoU 1-to-1 matching + all-point PR interpolation; 0-GT classes excluded from mAP mean).",
+        f"> **Dataset Fingerprint:** `{report.get('dataset_fingerprint')}`",
         "",
         "| Model | mAP@50 | mAP@75 | Precision@0.25 | Recall@0.25 | F1@0.25 | F1@0.50 | F1@0.75 |",
         "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
@@ -320,7 +342,13 @@ def format_ablation_markdown(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def parse_pred_specs(pred_args: list[str] | None, cfg: dict[str, Any], image_variant: str, eval_split: str, dummy: bool) -> dict[str, Path]:
+def parse_pred_specs(
+    pred_args: list[str] | None,
+    cfg: dict[str, Any],
+    image_variant: str,
+    eval_split: str,
+    dummy: bool,
+) -> dict[str, Path]:
     """Parse --preds name=path entries or auto-discover default yolo/frcnn/fusion prediction files."""
     if pred_args:
         parsed: dict[str, Path] = {}
@@ -333,12 +361,11 @@ def parse_pred_specs(pred_args: list[str] | None, cfg: dict[str, Any], image_var
 
     runs_dir = resolve_path(cfg["paths"]["runs_dir"])
     prefix = "dummy_" if dummy else ""
-    defaults = {
+    return {
         "yolo": runs_dir / f"{prefix}yolo_{image_variant}" / f"yolo_{image_variant}_{eval_split}_preds.pt",
         "frcnn": runs_dir / f"{prefix}frcnn_{image_variant}" / f"frcnn_{image_variant}_{eval_split}_preds.pt",
         "fusion": runs_dir / f"{prefix}fusion_{image_variant}" / f"fusion_{image_variant}_{eval_split}_preds.pt",
     }
-    return defaults
 
 
 def parse_args() -> argparse.Namespace:
@@ -358,6 +385,7 @@ def parse_args() -> argparse.Namespace:
         help="Image variant used for default prediction discovery",
     )
     parser.add_argument("--gt-coco", type=Path, default=None, help="Override COCO ground-truth JSON path")
+    parser.add_argument("--data-root", type=Path, default=None, help="Override processed data root directory")
     parser.add_argument("--eval-split", type=str, choices=("val", "test"), default="test", help="Evaluation split")
     parser.add_argument("--output-dir", type=Path, default=None, help="Override artifacts output directory")
     parser.add_argument("--device", type=str, default=None, help="Device flag (evaluation runs on CPU tensors)")
@@ -371,12 +399,13 @@ def main() -> None:
     cfg = load_config(config_path)
 
     image_variant = args.image_variant or str(cfg["preprocessing"]["ghe_ensemble"]["method"])
-    data_root = resolve_path(cfg["paths"]["data_dummy_processed"] if args.dummy else cfg["paths"]["data_processed"])
+    default_root = resolve_path(cfg["paths"]["data_dummy_processed"] if args.dummy else cfg["paths"]["data_processed"])
+    data_root = args.data_root or default_root
     gt_coco_path = args.gt_coco or (data_root / cfg["paths"]["coco_subdir"] / f"instances_{args.eval_split}.json")
     output_dir = args.output_dir or resolve_path(cfg["paths"]["artifacts_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    gt_by_image = load_coco_ground_truth(gt_coco_path)
+    gt_by_image, gt_fingerprint = load_coco_ground_truth(gt_coco_path)
     class_names = {int(k): str(v) for k, v in cfg["dataset"]["classes"].items()}
     iou_thresholds = [float(t) for t in cfg["evaluation"]["iou_thresholds"]]
     conf_thresholds = [float(t) for t in cfg["fusion"]["confidence_thresholds"]]
@@ -393,6 +422,15 @@ def main() -> None:
     for model_name, pred_path in pred_specs.items():
         if not pred_path.is_file():
             raise FileNotFoundError(f"Prediction file for '{model_name}' not found: {pred_path}")
+
+        pred_meta = read_prediction_meta(pred_path) or {}
+        pred_fp = pred_meta.get("dataset_fingerprint")
+        if gt_fingerprint and pred_fp and pred_fp != gt_fingerprint:
+            raise ValueError(
+                f"Dataset fingerprint mismatch for '{model_name}': "
+                f"pred={pred_fp} != gt={gt_fingerprint}. Refusing to evaluate mismatched dataset/split."
+            )
+
         preds_by_image = torch.load(pred_path, weights_only=True)
         models_report[model_name] = evaluate_predictions(
             preds_by_image=preds_by_image,
@@ -400,6 +438,7 @@ def main() -> None:
             class_names=class_names,
             iou_thresholds=iou_thresholds,
             conf_thresholds=conf_thresholds,
+            strict_image_ids=True,
         )
 
     report = {
@@ -407,6 +446,8 @@ def main() -> None:
         "eval_split": args.eval_split,
         "image_variant": image_variant,
         "gt_coco": str(gt_coco_path),
+        "dataset_fingerprint": gt_fingerprint,
+        "matching_protocol": MATCHING_PROTOCOL,
         "iou_thresholds": iou_thresholds,
         "conf_thresholds": conf_thresholds,
         "models": models_report,

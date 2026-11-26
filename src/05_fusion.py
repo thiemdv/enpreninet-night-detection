@@ -2,11 +2,11 @@
 
 Merges unified predictions from YOLOv5l (Branch 1) and Faster R-CNN ResNet-152
 (Branch 2) using:
-  1. Optional intra-model NMS (disabled by default since both detectors run native NMS).
-  2. Confidence thresholding (default score_floor=0.001 to preserve full PR curve for F07,
-     plus support for paper thresholds tau in [0.25, 0.50, 0.75]).
-  3. Concatenation + toggleable class-wise Global NMS via `torchvision.ops.batched_nms`
-     (supports E4 vs E5 ablation via `--no-global-nms` / `--global-nms`).
+  1. Strict image_id key alignment and sidecar dataset_fingerprint verification.
+  2. Optional intra-model NMS (disabled by default since detectors run native NMS).
+  3. Confidence thresholding (default 0.001 for full PR curve, plus unique stem-based
+     tau snapshots so E4 and E5 never overwrite each other).
+  4. Concatenation + toggleable class-wise Global NMS via `torchvision.ops.batched_nms`.
 
 Usage:
     python src/05_fusion.py --config configs/config.yaml --dummy --device cpu
@@ -43,6 +43,25 @@ def select_device(device_arg: str | None, cfg: dict[str, Any]) -> torch.device:
     if req == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(req)
+
+
+def read_prediction_meta(preds_path: Path) -> dict[str, Any] | None:
+    meta_path = preds_path.with_name(f"{preds_path.name}.meta.json")
+    if not meta_path.is_file():
+        return None
+    return json.loads(meta_path.read_text(encoding="utf-8"))
+
+
+def save_prediction_meta(preds_path: Path, meta: dict[str, Any]) -> Path:
+    meta_path = preds_path.with_name(f"{preds_path.name}.meta.json")
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return meta_path
+
+
+def snapshot_path_for_tau(output_path: Path, tau: float) -> Path:
+    """Derive a collision-free confidence-threshold snapshot path from output_path.stem."""
+    tau_tag = int(round(float(tau) * 100))
+    return output_path.with_name(f"{output_path.stem}_tau{tau_tag:02d}.pt")
 
 
 def empty_prediction() -> dict[str, torch.Tensor]:
@@ -93,11 +112,7 @@ def fuse_image_predictions(
     intra_nms_iou: float = 0.50,
     device: torch.device | str | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Fuse YOLOv5 and Faster R-CNN unified predictions for a single image.
-
-    Uses class-wise `torchvision.ops.batched_nms` when `global_nms_enabled=True`,
-    sorts results by descending score, and returns CPU tensors in the unified schema.
-    """
+    """Fuse YOLOv5 and Faster R-CNN unified predictions for a single image."""
     dev = torch.device(device) if device is not None else torch.device("cpu")
 
     y_boxes, y_scores, y_labels = _prepare_branch(
@@ -162,6 +177,20 @@ def fuse_prediction_dicts(
             device=device,
         )
     return fused
+
+
+def verify_and_resolve_fingerprint(yolo_path: Path, frcnn_path: Path) -> str | None:
+    """Ensure YOLO and Faster R-CNN sidecar metadata share the same dataset_fingerprint."""
+    yolo_meta = read_prediction_meta(yolo_path) or {}
+    frcnn_meta = read_prediction_meta(frcnn_path) or {}
+    fp_yolo = yolo_meta.get("dataset_fingerprint")
+    fp_frcnn = frcnn_meta.get("dataset_fingerprint")
+    if fp_yolo and fp_frcnn and fp_yolo != fp_frcnn:
+        raise ValueError(
+            f"Dataset fingerprint mismatch between YOLO ({fp_yolo}) and Faster R-CNN ({fp_frcnn}). "
+            f"Re-run both detectors on the same prepared dataset split."
+        )
+    return str(fp_yolo or fp_frcnn) if (fp_yolo or fp_frcnn) else None
 
 
 def parse_args() -> argparse.Namespace:
@@ -238,6 +267,8 @@ def main() -> None:
     if not frcnn_path.is_file():
         raise FileNotFoundError(f"Faster R-CNN predictions not found: {frcnn_path}")
 
+    dataset_fp = verify_and_resolve_fingerprint(yolo_path, frcnn_path)
+
     yolo_preds = torch.load(yolo_path, weights_only=True)
     frcnn_preds = torch.load(frcnn_path, weights_only=True)
 
@@ -254,8 +285,23 @@ def main() -> None:
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(fused_preds, output_path)
+    save_prediction_meta(
+        output_path,
+        {
+            "model": "enpreninet_fusion",
+            "image_variant": image_variant,
+            "eval_split": args.eval_split,
+            "global_nms_enabled": global_nms_enabled,
+            "global_nms_iou": global_nms_iou,
+            "apply_intra_nms": args.apply_intra_nms,
+            "conf_thres": args.conf_thres,
+            "dataset_fingerprint": dataset_fp,
+            "num_eval_images": len(fused_preds),
+            "dummy": args.dummy,
+        },
+    )
 
-    # Also save thresholded snapshots for paper tau values [0.25, 0.50, 0.75]
+    # P0 fix: snapshot filenames derive from output_path.stem so E4 and E5 never overwrite each other
     tau_counts: dict[str, int] = {}
     for tau in fusion_cfg["confidence_thresholds"]:
         tau_val = float(tau)
@@ -269,8 +315,7 @@ def main() -> None:
             intra_nms_iou=intra_nms_iou,
             device=device,
         )
-        tau_tag = int(round(tau_val * 100))
-        tau_path = output_path.parent / f"fusion_{image_variant}_{args.eval_split}_tau{tau_tag:02d}_preds.pt"
+        tau_path = snapshot_path_for_tau(output_path, tau_val)
         torch.save(tau_preds, tau_path)
         tau_counts[f"tau_{tau_val:.2f}"] = sum(int(v["boxes"].shape[0]) for v in tau_preds.values())
 
@@ -282,6 +327,7 @@ def main() -> None:
         "global_nms_iou": global_nms_iou,
         "apply_intra_nms": args.apply_intra_nms,
         "conf_thres": args.conf_thres,
+        "dataset_fingerprint": dataset_fp,
         "num_eval_images": len(fused_preds),
         "total_detections": sum(int(v["boxes"].shape[0]) for v in fused_preds.values()),
         "thresholded_detection_counts": tau_counts,

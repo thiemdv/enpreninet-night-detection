@@ -320,6 +320,45 @@ def test_labels_format_and_bounds() -> None:
 
     assert len(seen_image_ids) == sum(expected_dummy_counts.values())
     assert negative_sample_count >= 1, "Expected at least 1 night negative sample (0 target objects) to be retained"
+    assert "night_unannotated_10.jpg" not in seen_file_names, (
+        "Unannotated frame (labels=None) must be skipped by default"
+    )
+
+    # Verify dataset_meta.json fingerprint matches COCO info
+    meta_path = out_root / "dataset_meta.json"
+    assert meta_path.is_file(), f"Missing dataset_meta.json: {meta_path}"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    fp = meta.get("dataset_fingerprint")
+    assert isinstance(fp, str) and len(fp) == 64
+    assert meta.get("skipped_null_labels", 0) >= 1
+    for split_name in ("train", "val", "test"):
+        c_data = json.loads((coco_dir / f"instances_{split_name}.json").read_text(encoding="utf-8"))
+        assert c_data["info"]["dataset_fingerprint"] == fp
+
+
+def test_labels_resplit_cleans_stale_files(tmp_path: Path) -> None:
+    """F02 P0 audit: Re-running prepare_bdd_dataset with a new seed cleans stale files and updates fingerprint."""
+    import importlib.util
+
+    script_path = REPO_ROOT / "src" / "01_prepare_bdd.py"
+    spec = importlib.util.spec_from_file_location("prepare_bdd_mod", script_path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    cfg = load_config()
+    dummy_raw = REPO_ROOT / cfg["paths"]["data_dummy"]
+    labels_json = dummy_raw / "labels_dummy.json"
+    out_dir = tmp_path / "resplit_out"
+
+    stats_1 = mod.prepare_bdd_dataset(cfg, dummy_raw, labels_json, out_dir, seed=42, img_size=640)
+    stats_2 = mod.prepare_bdd_dataset(cfg, dummy_raw, labels_json, out_dir, seed=99, img_size=640)
+
+    assert stats_1["dataset_fingerprint"] != stats_2["dataset_fingerprint"]
+    raw_imgs = list((out_dir / cfg["paths"]["images_raw_subdir"]).rglob("*.jpg"))
+    yolo_txts = list((out_dir / cfg["paths"]["yolo_subdir"]).rglob("*.txt"))
+    assert len(raw_imgs) == 10, f"Stale raw images left behind after re-split: {len(raw_imgs)}"
+    assert len(yolo_txts) == 10, f"Stale YOLO labels left behind after re-split: {len(yolo_txts)}"
 
 
 def test_ghe_output_shape_and_channels() -> None:
@@ -409,6 +448,48 @@ def test_ghe_output_shape_and_channels() -> None:
     assert int(out_grad_std.max()) >= 200
     # fig4_literal max is bounded by W^2 = 49
     assert int(out_grad_lit.max()) <= 49
+
+    # 3. Verify ghe_meta.json benchmark & fingerprint metadata
+    ghe_meta_path = ghe_dir / "ghe_meta.json"
+    assert ghe_meta_path.is_file(), f"Missing ghe_meta.json: {ghe_meta_path}"
+    ghe_meta = json.loads(ghe_meta_path.read_text(encoding="utf-8"))
+    assert ghe_meta["method"] == method
+    assert ghe_meta["total_images"] == expected_total
+    assert ghe_meta["ms_per_image"] >= 0.0
+    assert isinstance(ghe_meta.get("dataset_fingerprint"), str) and len(ghe_meta["dataset_fingerprint"]) == 64
+
+    # 4. Cross-check vectorized sliding_window_ghe against explicit 256-bin histogram reference on 16x16 image
+    rng = np.random.default_rng(123)
+    tiny = rng.integers(0, 120, size=(16, 16), dtype=np.uint8)
+    w_ref = 5
+    pad = w_ref // 2
+    padded_tiny = np.pad(tiny, pad_width=pad, mode="reflect")
+    for mode in ("fig4_literal", "fig4_normalized", "standard_local_he"):
+        vec_out = ghe_mod.sliding_window_ghe(tiny, window_size=w_ref, method=mode, border_mode="reflect")
+        ref_out = np.zeros_like(tiny)
+        for r in range(16):
+            for c in range(16):
+                win = padded_tiny[r : r + w_ref, c : c + w_ref]
+                h_val = int(win.max())
+                xc = int(tiny[r, c])
+                if h_val == 0:
+                    ref_out[r, c] = xc
+                    continue
+                hist = np.bincount(win.ravel(), minlength=256).astype(np.float64)
+                if mode == "fig4_literal":
+                    cdf_xc = (hist[: xc + 1] / float(h_val)).sum()
+                    val = np.rint(float(h_val) * cdf_xc)
+                elif mode == "fig4_normalized":
+                    cdf_xc = (hist[: xc + 1] / float(w_ref * w_ref)).sum()
+                    val = np.rint(float(h_val) * cdf_xc)
+                else:
+                    if int(win.min()) == h_val:
+                        val = float(xc)
+                    else:
+                        cdf_xc = (hist[: xc + 1] / float(w_ref * w_ref)).sum()
+                        val = np.rint(255.0 * cdf_xc)
+                ref_out[r, c] = int(np.clip(val, 0.0, 255.0))
+        assert np.array_equal(vec_out, ref_out), f"Vectorized GHE differs from 256-bin reference for mode={mode}"
 
 
 def test_yolo_output() -> None:
@@ -593,6 +674,17 @@ def test_frcnn_output() -> None:
         assert dec_empty["scores"].shape == (0,) and dec_empty["scores"].dtype == torch.float32
         assert dec_empty["labels"].shape == (0,) and dec_empty["labels"].dtype == torch.int64
 
+    # Verify sidecar .meta.json fingerprint and backbone trainability when pretrained=False
+    meta_path = preds_path.with_name(f"{preds_path.name}.meta.json")
+    assert meta_path.is_file(), f"Missing Faster R-CNN prediction sidecar meta: {meta_path}"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert isinstance(meta.get("dataset_fingerprint"), str) and len(meta["dataset_fingerprint"]) == 64
+
+    untrained_model = frcnn_mod.build_faster_rcnn_model(pretrained=False)
+    assert all(p.requires_grad for p in untrained_model.backbone.body.parameters()), (
+        "Expected all ResNet-152 backbone stages trainable when weights=None"
+    )
+
 
 def test_fusion_output() -> None:
     """F06: Verify on-disk fused predictions (.pt) and all 4 fusion behavioral scenarios via fuse_image_predictions()."""
@@ -714,6 +806,16 @@ def test_fusion_output() -> None:
     assert out_both_empty["scores"].shape == (0,) and out_both_empty["scores"].dtype == torch.float32
     assert out_both_empty["labels"].shape == (0,) and out_both_empty["labels"].dtype == torch.int64
 
+    # P0/P1 audit: E4 and E5 confidence snapshot filenames must not collide, and sidecar meta exists
+    e4_out = Path("runs/fusion_standard_local_he/fusion_standard_local_he_e4_noglobal_test_preds.pt")
+    e5_out = Path("runs/fusion_standard_local_he/fusion_standard_local_he_e5_full_test_preds.pt")
+    for tau in thresholds:
+        assert fusion_mod.snapshot_path_for_tau(e4_out, tau) != fusion_mod.snapshot_path_for_tau(e5_out, tau)
+    fusion_meta_path = preds_path.with_name(f"{preds_path.name}.meta.json")
+    assert fusion_meta_path.is_file(), f"Missing fusion sidecar meta: {fusion_meta_path}"
+    fusion_meta = json.loads(fusion_meta_path.read_text(encoding="utf-8"))
+    assert isinstance(fusion_meta.get("dataset_fingerprint"), str) and len(fusion_meta["dataset_fingerprint"]) == 64
+
 
 def test_eval_output() -> None:
     """F07: Verify on-disk dummy metrics report/table and 4 deterministic toy evaluation scenarios."""
@@ -822,9 +924,18 @@ def test_eval_output() -> None:
     for k in ("precision", "recall", "f1", "map50", "map75"):
         assert math.isfinite(res_s4_no_gt[k]) and res_s4_no_gt[k] == 0.0
 
+    # P0 audit: mismatched image_id sets must raise ValueError
+    mismatched_pred = {999: pred_s1[1]}
+    with pytest.raises(ValueError, match="image_ids"):
+        eval_mod.evaluate_predictions(mismatched_pred, gt_s1, class_names, strict_image_ids=True)
+
+    # P1 audit: verify Pascal VOC greedy best-IoU matching protocol is recorded
+    assert report.get("matching_protocol") == "pascal_voc_greedy_best_iou_all_point_ap"
+    assert isinstance(report.get("dataset_fingerprint"), str) and len(report["dataset_fingerprint"]) == 64
+
 
 def test_notebook_clean() -> None:
-    """F08: Verify notebooks/Colab_Runner.ipynb is thin (shell/magic + Drive mount only) and covers all scripts & E0–E5."""
+    """F08: Verify notebooks/Colab_Runner.ipynb is thin (%%bash/shell/magic + Drive mount only), fail-fast, and covers E0–E5."""
     nb_path = REPO_ROOT / "notebooks" / "Colab_Runner.ipynb"
     if not nb_path.is_file():
         pytest.skip("Waiting for F08 (notebooks/Colab_Runner.ipynb)")
@@ -838,16 +949,28 @@ def test_notebook_clean() -> None:
         'drive.mount("/content/drive")',
     }
     all_code_lines: list[str] = []
+    bash_cells_checked = 0
 
     for cell in nb.get("cells", []):
         if cell.get("cell_type") != "code":
             continue
-        for raw_line in cell.get("source", []):
-            line = raw_line.strip()
-            all_code_lines.append(line)
+        lines = [raw_line.strip() for raw_line in cell.get("source", [])]
+        non_empty = [ln for ln in lines if ln]
+        all_code_lines.extend(lines)
+        if not non_empty:
+            continue
+
+        # %%bash cells execute pure bash; enforce fail-fast `set -euo pipefail`
+        if non_empty[0] == "%%bash":
+            bash_cells_checked += 1
+            assert any("set -euo pipefail" in ln for ln in non_empty[1:4]), (
+                f"%%bash cell missing fail-fast 'set -euo pipefail': {non_empty[:3]}"
+            )
+            continue
+
+        for line in non_empty:
             if (
-                not line
-                or line.startswith("#")
+                line.startswith("#")
                 or line.startswith("!")
                 or line.startswith("%")
                 or line in allowed_python_lines
@@ -855,6 +978,7 @@ def test_notebook_clean() -> None:
                 continue
             raise AssertionError(f"Non-shell Python logic found in Colab_Runner.ipynb: {line!r}")
 
+    assert bash_cells_checked >= 5, "Expected fail-fast %%bash cells for Colab orchestration stages"
     joined_code = "\n".join(all_code_lines)
     required_scripts = (
         "01_prepare_bdd.py",
@@ -869,3 +993,6 @@ def test_notebook_clean() -> None:
 
     for exp_tag in ("E0", "E1", "E2", "E3", "E4", "E5"):
         assert exp_tag in joined_code, f"Colab_Runner.ipynb missing experiment {exp_tag}"
+    assert "checkout v7.0" in joined_code, "Expected pinned YOLOv5 tag v7.0 in Colab_Runner.ipynb"
+    assert "/content/work/processed" in joined_code, "Expected local Colab SSD path for data/processed"
+    assert "--max-images 200" in joined_code, "Expected GPU pilot cell in Colab_Runner.ipynb"
