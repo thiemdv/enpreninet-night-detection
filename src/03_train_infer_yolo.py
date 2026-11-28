@@ -409,6 +409,32 @@ def _parse_yolo_txt_to_xyxy(txt_path: Path, img_size: int) -> np.ndarray | None:
     return np.asarray(rows, dtype=np.float32)
 
 
+_YOLO_COMPAT_BOOTSTRAP = "\n".join(
+    [
+        "import os, runpy, sys, numpy as np",
+        "from PIL import Image, ImageFont",
+        "os.environ['TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD'] = '1'",
+        "if not hasattr(np, 'trapz') and hasattr(np, 'trapezoid'):",
+        "    np.trapz = np.trapezoid",
+        "if not hasattr(Image, 'ANTIALIAS'):",
+        "    Image.ANTIALIAS = Image.Resampling.LANCZOS",
+        "if not hasattr(ImageFont.FreeTypeFont, 'getsize'):",
+        "    def _ft_getsize(self, text, *a, **kw):",
+        "        b = self.getbbox(text)",
+        "        return (b[2] - b[0], b[3] - b[1])",
+        "    ImageFont.FreeTypeFont.getsize = _ft_getsize",
+        "sys.argv = sys.argv[1:]",
+        "sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[0])))",
+        "runpy.run_path(sys.argv[0], run_name='__main__')",
+    ]
+)
+
+
+def _build_yolo_compat_cmd(script_path: Path, script_args: list[str]) -> list[str]:
+    """Launch YOLOv5 v7.0 script with PyTorch 2.6+ / NumPy 2.x / Pillow 10+ compatibility shims."""
+    return [sys.executable, "-c", _YOLO_COMPAT_BOOTSTRAP, str(script_path), *script_args]
+
+
 def run_real_yolo(
     cfg: dict[str, Any],
     data_root: Path,
@@ -452,32 +478,33 @@ def run_real_yolo(
     if train_out_dir.exists():
         shutil.rmtree(train_out_dir)
 
-    # A07 fix: PyTorch 2.6+ defaults torch.load(weights_only=True), which blocks legacy YOLOv5 v7.0 checkpoints
+    # A07 fix: PyTorch 2.6+ / NumPy 2.x / Pillow 10+ compatibility for pinned YOLOv5 v7.0
     yolo_env = {**os.environ, "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD": "1"}
 
-    train_cmd = [
-        sys.executable,
-        str(train_py),
-        "--img",
-        str(img_size),
-        "--batch",
-        str(batch_size),
-        "--epochs",
-        str(epochs),
-        "--seed",
-        str(seed),
-        "--data",
-        str(dataset_yaml),
-        "--weights",
-        f"{yolo_cfg['variant']}.pt",
-        "--project",
-        str(run_dir),
-        "--name",
-        "train",
-        "--exist-ok",
-        "--device",
-        device_str,
-    ]
+    train_cmd = _build_yolo_compat_cmd(
+        train_py,
+        [
+            "--img",
+            str(img_size),
+            "--batch",
+            str(batch_size),
+            "--epochs",
+            str(epochs),
+            "--seed",
+            str(seed),
+            "--data",
+            str(dataset_yaml),
+            "--weights",
+            f"{yolo_cfg['variant']}.pt",
+            "--project",
+            str(run_dir),
+            "--name",
+            "train",
+            "--exist-ok",
+            "--device",
+            device_str,
+        ],
+    )
     subprocess.run(train_cmd, check=True, env=yolo_env)
 
     best_pt = run_dir / "train" / "weights" / "best.pt"
@@ -491,30 +518,31 @@ def run_real_yolo(
         shutil.rmtree(infer_dir)
 
     eval_img_dir = view_root / "images" / eval_split
-    detect_cmd = [
-        sys.executable,
-        str(detect_py),
-        "--weights",
-        str(exported_weights),
-        "--source",
-        str(eval_img_dir),
-        "--imgsz",
-        str(img_size),
-        "--conf-thres",
-        str(score_floor),
-        "--iou-thres",
-        str(intra_nms_iou),
-        "--save-txt",
-        "--save-conf",
-        "--nosave",
-        "--project",
-        str(run_dir),
-        "--name",
-        f"infer_{eval_split}",
-        "--exist-ok",
-        "--device",
-        device_str,
-    ]
+    detect_cmd = _build_yolo_compat_cmd(
+        detect_py,
+        [
+            "--weights",
+            str(exported_weights),
+            "--source",
+            str(eval_img_dir),
+            "--imgsz",
+            str(img_size),
+            "--conf-thres",
+            str(score_floor),
+            "--iou-thres",
+            str(intra_nms_iou),
+            "--save-txt",
+            "--save-conf",
+            "--nosave",
+            "--project",
+            str(run_dir),
+            "--name",
+            f"infer_{eval_split}",
+            "--exist-ok",
+            "--device",
+            device_str,
+        ],
+    )
     subprocess.run(detect_cmd, check=True, env=yolo_env)
 
     labels_out_dir = infer_dir / "labels"
