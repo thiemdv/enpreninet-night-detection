@@ -45,10 +45,14 @@ preprocessing:
   ghe_ensemble:
     image_size: 640
     gaussian_kernel_size: 3
-    gaussian_sigma: 2.0
-    window_size: 15 # [OPEN] W x W sliding window for local histogram equalization
+    gaussian_sigma: 2.0 # [PAPER] Fig. 4 Step 1 text states sigma=2.0 (used by legacy sliding-window modes)
+    window_size: 15 # [OPEN] W x W sliding window for sliding-window modes (fig4_literal / fig4_normalized / standard_local_he)
+    tiled_sigma: 1.0 # [PAPER] Fig. 4 Step 2 printed 3x3 kernel [0.075, 0.124, 0.204] matches sigma=1.0
+    tiled_window_size: 64 # [OPEN] W x W tile grid size for tiled_ghe_gray / tiled_ghe_lab (640/64 = 10x10 tiles)
+    clip_limit: 0.0 # [OPEN] Histogram clip limit (>0 enables CLAHE-like clipping to suppress dark-region noise/halos)
+    interpolate: true # [PROJECT] Bilinear LUT interpolation across neighboring tiles (avoids block seams, matches Fig. 8)
     output_channels: 3
-    method: "standard_local_he" # "fig4_literal" | "fig4_normalized" | "standard_local_he"
+    method: "tiled_ghe_gray" # "tiled_ghe_gray" | "tiled_ghe_lab" | "standard_local_he" | "fig4_normalized" | "fig4_literal"
     border_mode: "reflect" # "reflect" | "replicate" | "constant"
     zero_division_policy: "identity" # "identity" | "zero"
     uniform_window_policy: "identity" # "identity" | "stretch" (applies to standard_local_he)

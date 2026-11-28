@@ -10,8 +10,8 @@ images/raw/{train,val,test}/, and exports split manifests, dataset_meta.json
 YOLO .txt labels, and COCO instances_*.json.
 
 Usage:
-    python src/01_prepare_bdd.py --config configs/config.yaml --dummy
-    python src/01_prepare_bdd.py --config configs/config.yaml --raw-dir /content/raw_bdd/bdd100k
+    python src/prepare_bdd.py --config configs/config.yaml --dummy
+    python src/prepare_bdd.py --config configs/config.yaml --raw-dir /content/raw_bdd/bdd100k
 """
 
 from __future__ import annotations
@@ -560,7 +560,7 @@ def main() -> None:
         include_null_labels=args.include_null_labels,
         max_images=args.max_images,
     )
-    print(f"[01_prepare_bdd] Completed ({'dummy' if args.dummy else 'full'}) -> {out_dir}")
+    print(f"[prepare_bdd] Completed ({'dummy' if args.dummy else 'full'}) -> {out_dir}")
     print(json.dumps(stats, indent=2))
 
 

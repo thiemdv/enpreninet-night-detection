@@ -10,8 +10,8 @@ between every prediction `.meta.json` sidecar and COCO GT (opt-in override
 via `--allow-legacy-predictions`), plus strict `set(preds) == set(gt)` equality.
 
 Usage:
-    python src/06_evaluate.py --config configs/config.yaml --dummy --device cpu
-    python src/06_evaluate.py --config configs/config.yaml --run-id pilot --data-root /content/work/pilot_processed --preds ...
+    python src/evaluate.py --config configs/config.yaml --dummy --device cpu
+    python src/evaluate.py --config configs/config.yaml --run-id pilot --data-root /content/work/pilot_processed --preds ...
 """
 
 from __future__ import annotations
@@ -26,7 +26,14 @@ import torch
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-VALID_IMAGE_VARIANTS = ("raw", "fig4_literal", "fig4_normalized", "standard_local_he")
+VALID_IMAGE_VARIANTS = (
+    "raw",
+    "fig4_literal",
+    "fig4_normalized",
+    "standard_local_he",
+    "tiled_ghe_gray",
+    "tiled_ghe_lab",
+)
 MATCHING_PROTOCOL = "pascal_voc_greedy_best_iou_all_point_ap"
 
 
@@ -509,7 +516,7 @@ def main() -> None:
         name: {k: round(float(m[k]), 4) for k in ("precision", "recall", "f1", "map50", "map75")}
         for name, m in models_report.items()
     }
-    print(f"[06_evaluate] Completed (run_id={run_id}) -> {json_path} & {md_path}")
+    print(f"[evaluate] Completed (run_id={run_id}) -> {json_path} & {md_path}")
     print(json.dumps(compact, indent=2))
 
 

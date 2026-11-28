@@ -22,7 +22,7 @@ Trong điều kiện ánh sáng yếu hoặc ban đêm, các mô hình thị gi�
 
 Repository này được xây dựng nhằm mô phỏng lại phương pháp đề xuất trong bài báo *"Improved multi object detection in night vision environment for autonomous vehicle using EnPreNiNet model"* (Ranjitha & Atham, 2026). Hệ thống kết hợp kỹ thuật cân bằng tương phản cục bộ (**GHE Ensemble**) cùng cơ chế hợp nhất quyết định từ hai kiến trúc phát hiện vật thể (**Enhanced Faster R-CNN** và **Enhanced YOLOv5**).
 
-> **Note:** Toàn bộ pipeline `F01–F08` (`src/01_prepare_bdd.py` đến `src/06_evaluate.py`, bộ kiểm thử bất biến `tests/test_invariants.py`, và `notebooks/Colab_Runner.ipynb`) đã hoàn thiện và được kiểm chứng offline trên CPU; sẵn sàng chạy huấn luyện/đánh giá đầy đủ E0–E5 trên Google Colab GPU.
+> **Note:** Toàn bộ pipeline `F01–F08` (`src/prepare_bdd.py` đến `src/evaluate.py`, bộ kiểm thử bất biến `tests/test_invariants.py`, và `notebooks/Colab_Runner.ipynb`) đã hoàn thiện và được kiểm chứng offline trên CPU; sẵn sàng chạy huấn luyện/đánh giá đầy đủ E0–E5 trên Google Colab GPU.
 
 ---
 
@@ -97,12 +97,12 @@ Các chỉ số đánh giá được sử dụng trong nghiên cứu bao gồm *
 | Feature | Module | Mô tả |
 | :--- | :--- | :--- |
 | **F01** | `configs/config.yaml`, `requirements.txt`, `tests/test_invariants.py` | Khởi tạo cấu hình trung tâm và bộ kiểm thử bất biến |
-| **F02** | `src/01_prepare_bdd.py` | Lọc ảnh ban đêm BDD100K (3 lớp), chia 70/20/10, xuất YOLO `.txt` & COCO `.json` |
-| **F03** | `src/02_ghe_ensemble.py` | Tiền xử lý GHE Ensemble 15 bước (3 chế độ: `fig4_literal`, `fig4_normalized`, `standard_local_he`) |
-| **F04** | `src/03_train_infer_yolo.py` | Huấn luyện & suy luận YOLOv5l theo schema dự đoán thống nhất (`xyxy`, nhãn `0..2`) |
-| **F05** | `src/04_train_infer_frcnn.py` | Huấn luyện & suy luận Faster R-CNN (`resnet_fpn_backbone("resnet152")`), map nhãn `1..3 -> 0..2` |
-| **F06** | `src/05_fusion.py` | Hợp nhất mức điểm số EnPreNiNet (intra-NMS, ngưỡng tin cậy, bật/tắt global NMS) |
-| **F07** | `src/06_evaluate.py` | Đánh giá Precision, Recall, F1, AP@50/mAP@50, AP@75/mAP@75 và báo cáo ablation |
+| **F02** | `src/prepare_bdd.py` | Lọc ảnh ban đêm BDD100K (3 lớp), chia 70/20/10, xuất YOLO `.txt` & COCO `.json` |
+| **F03** | `src/ghe_ensemble.py` | Tiền xử lý GHE Ensemble 15 bước (`tiled_ghe_gray`, `tiled_ghe_lab`, và 3 chế độ cửa sổ trượt Fig. 4) |
+| **F04** | `src/train_infer_yolo.py` | Huấn luyện & suy luận YOLOv5l theo schema dự đoán thống nhất (`xyxy`, nhãn `0..2`) |
+| **F05** | `src/train_infer_frcnn.py` | Huấn luyện & suy luận Faster R-CNN (`resnet_fpn_backbone("resnet152")`), map nhãn `1..3 -> 0..2` |
+| **F06** | `src/fusion.py` | Hợp nhất mức điểm số EnPreNiNet (intra-NMS, ngưỡng tin cậy, bật/tắt global NMS) |
+| **F07** | `src/evaluate.py` | Đánh giá Precision, Recall, F1, AP@50/mAP@50, AP@75/mAP@75 và báo cáo ablation |
 | **F08** | `notebooks/Colab_Runner.ipynb` | Notebook điều phối mỏng chạy ma trận thực nghiệm **E0–E5** trên Google Colab & lưu Google Drive |
 
 **Ma trận thực nghiệm (E0–E5):**
@@ -116,7 +116,7 @@ Các chỉ số đánh giá được sử dụng trong nghiên cứu bao gồm *
 
 > **Ghi chú học thuật & Giới hạn triển khai:**
 > - Bộ tiền xử lý GHE tái hiện thuật toán 15 bước tại **Hình 4** của bài báo (`standard_local_he` làm cấu hình chính, `fig4_literal`/`fig4_normalized` làm đối chứng), không bao gồm các nhánh mở rộng của Hình 6.
-> - Bộ đánh giá `src/06_evaluate.py` sử dụng quy ước khớp 1-1 kiểu **Pascal VOC** (greedy best-IoU) kết hợp nội suy PR toàn điểm (**all-point AP@50/AP@75**, loại lớp có `0` GT khỏi trung bình `mAP`), khác với COCO 101-point mAP@[.50:.95].
+> - Bộ đánh giá `src/evaluate.py` sử dụng quy ước khớp 1-1 kiểu **Pascal VOC** (greedy best-IoU) kết hợp nội suy PR toàn điểm (**all-point AP@50/AP@75**, loại lớp có `0` GT khỏi trung bình `mAP`), khác với COCO 101-point mAP@[.50:.95].
 > - Khi huấn luyện thật, `YOLOv5l` khởi tạo từ trọng số detector pretrained COCO trong khi `Faster R-CNN` khởi tạo từ backbone `ResNet-152` pretrained ImageNet; sự khác biệt khởi tạo này cần được ghi nhận khi phân tích kết quả thực nghiệm.
 
 ---

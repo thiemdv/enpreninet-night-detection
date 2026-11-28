@@ -13,7 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = REPO_ROOT / "configs" / "config.yaml"
 REQUIREMENTS_PATH = REPO_ROOT / "requirements.txt"
 
-VALID_GHE_METHODS = {"fig4_literal", "fig4_normalized", "standard_local_he"}
+VALID_GHE_METHODS = {"fig4_literal", "fig4_normalized", "standard_local_he", "tiled_ghe_gray", "tiled_ghe_lab"}
 VALID_BORDER_MODES = {"reflect", "replicate", "constant"}
 VALID_ZERO_DIV_POLICIES = {"identity", "zero"}
 VALID_UNIFORM_WINDOW_POLICIES = {"identity", "stretch"}
@@ -93,6 +93,10 @@ def test_config_ghe_invariants() -> None:
     assert ghe["uniform_window_policy"] in VALID_UNIFORM_WINDOW_POLICIES, (
         f"Invalid uniform_window_policy: {ghe.get('uniform_window_policy')}"
     )
+    assert pytest.approx(ghe["tiled_sigma"], abs=1e-6) == 1.0
+    assert isinstance(ghe["tiled_window_size"], int) and ghe["tiled_window_size"] >= 2
+    assert isinstance(ghe["clip_limit"], (int, float)) and ghe["clip_limit"] >= 0.0
+    assert isinstance(ghe["interpolate"], bool)
 
 
 def test_config_models_and_fusion_invariants() -> None:
@@ -210,9 +214,9 @@ def test_pipeline_unified_prediction_schema_and_label_mapping() -> None:
 
 def test_labels_format_and_bounds() -> None:
     """F02: Verify isolated dummy outputs, split disjointness, YOLO bounds, negative samples, and YOLO<->COCO round-trip."""
-    script_path = REPO_ROOT / "src" / "01_prepare_bdd.py"
+    script_path = REPO_ROOT / "src" / "prepare_bdd.py"
     if not script_path.is_file():
-        pytest.skip("Waiting for F02 (src/01_prepare_bdd.py)")
+        pytest.skip("Waiting for F02 (src/prepare_bdd.py)")
 
     import cv2
 
@@ -340,7 +344,7 @@ def test_labels_resplit_cleans_stale_files(tmp_path: Path) -> None:
     """F02 P0 audit: Re-running prepare_bdd_dataset with a new seed cleans stale files and updates fingerprint."""
     import importlib.util
 
-    script_path = REPO_ROOT / "src" / "01_prepare_bdd.py"
+    script_path = REPO_ROOT / "src" / "prepare_bdd.py"
     spec = importlib.util.spec_from_file_location("prepare_bdd_mod", script_path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
@@ -363,9 +367,9 @@ def test_labels_resplit_cleans_stale_files(tmp_path: Path) -> None:
 
 def test_ghe_output_shape_and_channels() -> None:
     """F03: Verify on-disk lossless PNG GHE outputs, comparison artifact, and all 3 GHE formulas on edge-case inputs."""
-    script_path = REPO_ROOT / "src" / "02_ghe_ensemble.py"
+    script_path = REPO_ROOT / "src" / "ghe_ensemble.py"
     if not script_path.is_file():
-        pytest.skip("Waiting for F03 (src/02_ghe_ensemble.py)")
+        pytest.skip("Waiting for F03 (src/ghe_ensemble.py)")
 
     import importlib.util
 
@@ -494,9 +498,9 @@ def test_ghe_output_shape_and_channels() -> None:
 
 def test_yolo_output() -> None:
     """F04: Verify YOLOv5l wrapper unified predictions (.pt), schema, bounds, and 0-detection handling."""
-    script_path = REPO_ROOT / "src" / "03_train_infer_yolo.py"
+    script_path = REPO_ROOT / "src" / "train_infer_yolo.py"
     if not script_path.is_file():
-        pytest.skip("Waiting for F04 (src/03_train_infer_yolo.py)")
+        pytest.skip("Waiting for F04 (src/train_infer_yolo.py)")
 
     import importlib.util
 
@@ -567,9 +571,9 @@ def test_yolo_output() -> None:
 
 def test_frcnn_output() -> None:
     """F05: Verify Faster R-CNN ResNet-152 unified predictions (.pt), target encoding (0..2->1..3), and decoding (1..3->0..2)."""
-    script_path = REPO_ROOT / "src" / "04_train_infer_frcnn.py"
+    script_path = REPO_ROOT / "src" / "train_infer_frcnn.py"
     if not script_path.is_file():
-        pytest.skip("Waiting for F05 (src/04_train_infer_frcnn.py)")
+        pytest.skip("Waiting for F05 (src/train_infer_frcnn.py)")
 
     import importlib.util
 
@@ -688,9 +692,9 @@ def test_frcnn_output() -> None:
 
 def test_fusion_output() -> None:
     """F06: Verify on-disk fused predictions (.pt) and all 4 fusion behavioral scenarios via fuse_image_predictions()."""
-    script_path = REPO_ROOT / "src" / "05_fusion.py"
+    script_path = REPO_ROOT / "src" / "fusion.py"
     if not script_path.is_file():
-        pytest.skip("Waiting for F06 (src/05_fusion.py)")
+        pytest.skip("Waiting for F06 (src/fusion.py)")
 
     import importlib.util
 
@@ -825,9 +829,9 @@ def test_fusion_output() -> None:
 
 def test_eval_output() -> None:
     """F07: Verify on-disk dummy metrics report/table and 4 deterministic toy evaluation scenarios."""
-    script_path = REPO_ROOT / "src" / "06_evaluate.py"
+    script_path = REPO_ROOT / "src" / "evaluate.py"
     if not script_path.is_file():
-        pytest.skip("Waiting for F07 (src/06_evaluate.py)")
+        pytest.skip("Waiting for F07 (src/evaluate.py)")
 
     import importlib.util
     import math
@@ -989,12 +993,12 @@ def test_notebook_clean() -> None:
     assert bash_cells_checked >= 5, "Expected fail-fast %%bash cells for Colab orchestration stages"
     joined_code = "\n".join(all_code_lines)
     required_scripts = (
-        "01_prepare_bdd.py",
-        "02_ghe_ensemble.py",
-        "03_train_infer_yolo.py",
-        "04_train_infer_frcnn.py",
-        "05_fusion.py",
-        "06_evaluate.py",
+        "prepare_bdd.py",
+        "ghe_ensemble.py",
+        "train_infer_yolo.py",
+        "train_infer_frcnn.py",
+        "fusion.py",
+        "evaluate.py",
     )
     for script_name in required_scripts:
         assert script_name in joined_code, f"Colab_Runner.ipynb missing invocation of {script_name}"
@@ -1028,7 +1032,7 @@ def _load_src_module(module_name: str, filename: str):
 
 def test_fusion_rejects_missing_or_mismatched_fingerprint_and_variant(tmp_path: Path) -> None:
     """A02: Fusion must fail-closed when a branch lacks a fingerprint or has mismatched variant/split."""
-    fusion_mod = _load_src_module("fusion_a02", "05_fusion.py")
+    fusion_mod = _load_src_module("fusion_a02", "fusion.py")
     yolo_pt = tmp_path / "yolo.pt"
     frcnn_pt = tmp_path / "frcnn.pt"
     yolo_pt.write_bytes(b"")
@@ -1061,8 +1065,8 @@ def test_fusion_rejects_missing_or_mismatched_fingerprint_and_variant(tmp_path: 
 
 def test_detectors_reject_stale_ghe_metadata(tmp_path: Path) -> None:
     """A03: Both YOLO and Faster R-CNN wrappers must reject GHE images whose fingerprint != COCO fingerprint."""
-    yolo_mod = _load_src_module("yolo_a03", "03_train_infer_yolo.py")
-    frcnn_mod = _load_src_module("frcnn_a03", "04_train_infer_frcnn.py")
+    yolo_mod = _load_src_module("yolo_a03", "train_infer_yolo.py")
+    frcnn_mod = _load_src_module("frcnn_a03", "train_infer_frcnn.py")
 
     ghe_dir = tmp_path / "images" / "standard_local_he"
     ghe_dir.mkdir(parents=True, exist_ok=True)
@@ -1077,7 +1081,7 @@ def test_detectors_reject_stale_ghe_metadata(tmp_path: Path) -> None:
 
 def test_evaluator_rejects_different_dataset_same_image_ids(tmp_path: Path) -> None:
     """A02: Evaluator must reject predictions from a different dataset even when image_id keys match."""
-    eval_mod = _load_src_module("eval_a02", "06_evaluate.py")
+    eval_mod = _load_src_module("eval_a02", "evaluate.py")
     pred_pt = tmp_path / "preds.pt"
     pred_pt.write_bytes(b"")
     (tmp_path / "preds.pt.meta.json").write_text(
@@ -1097,18 +1101,18 @@ def test_evaluator_rejects_different_dataset_same_image_ids(tmp_path: Path) -> N
 def test_pilot_and_full_output_paths_are_isolated() -> None:
     """A01: Pilot and Full training must never share any run, weight, or artifact output path."""
     cfg = load_config()
-    ghe_mod = _load_src_module("ghe_a01", "02_ghe_ensemble.py")
-    yolo_mod = _load_src_module("yolo_a01", "03_train_infer_yolo.py")
-    frcnn_mod = _load_src_module("frcnn_a01", "04_train_infer_frcnn.py")
-    fusion_mod = _load_src_module("fusion_a01", "05_fusion.py")
-    eval_mod = _load_src_module("eval_a01", "06_evaluate.py")
+    ghe_mod = _load_src_module("ghe_a01", "ghe_ensemble.py")
+    yolo_mod = _load_src_module("yolo_a01", "train_infer_yolo.py")
+    frcnn_mod = _load_src_module("frcnn_a01", "train_infer_frcnn.py")
+    fusion_mod = _load_src_module("fusion_a01", "fusion.py")
+    eval_mod = _load_src_module("eval_a01", "evaluate.py")
 
     def _collect_paths(run_id: str) -> set[Path]:
         paths: set[Path] = set()
-        paths.add(ghe_mod.resolve_ghe_artifact_path(cfg, run_id, "standard_local_he"))
-        paths.update(yolo_mod.resolve_yolo_output_paths(cfg, run_id, "standard_local_he", "test", dummy=False))
-        paths.update(frcnn_mod.resolve_frcnn_output_paths(cfg, run_id, "standard_local_he", "test", dummy=False))
-        paths.update(fusion_mod.resolve_fusion_paths(cfg, run_id, "standard_local_he", "test"))
+        paths.add(ghe_mod.resolve_ghe_artifact_path(cfg, run_id, "tiled_ghe_gray"))
+        paths.update(yolo_mod.resolve_yolo_output_paths(cfg, run_id, "tiled_ghe_gray", "test", dummy=False))
+        paths.update(frcnn_mod.resolve_frcnn_output_paths(cfg, run_id, "tiled_ghe_gray", "test", dummy=False))
+        paths.update(fusion_mod.resolve_fusion_paths(cfg, run_id, "tiled_ghe_gray", "test"))
         paths.update(eval_mod.resolve_eval_output_paths(cfg, run_id))
         return paths
 
@@ -1119,3 +1123,77 @@ def test_pilot_and_full_output_paths_are_isolated() -> None:
     assert pilot_paths.isdisjoint(full_paths), f"Overlap between pilot and full paths: {pilot_paths & full_paths}"
     assert dummy_paths.isdisjoint(full_paths), f"Overlap between dummy and full paths: {dummy_paths & full_paths}"
     assert dummy_paths.isdisjoint(pilot_paths), f"Overlap between dummy and pilot paths: {dummy_paths & pilot_paths}"
+
+
+def test_tiled_ghe_gray_and_lab_contracts() -> None:
+    """Verify tiled_ghe_gray & tiled_ghe_lab edge cases, Fig. 4 sigma=1.0 kernel, and low-RAM LUT equivalence."""
+    ghe_mod = _load_src_module("ghe_tiled_test", "ghe_ensemble.py")
+
+    # 1. Verify Fig. 4 Step 2 printed 3x3 Gaussian kernel matches sigma=1.0
+    k1 = ghe_mod.build_gaussian_kernel(kernel_size=3, sigma=1.0)
+    expected_fig4_k = np.array(
+        [[0.075, 0.124, 0.075], [0.124, 0.204, 0.124], [0.075, 0.124, 0.075]],
+        dtype=np.float64,
+    )
+    assert np.allclose(k1, expected_fig4_k, atol=1e-3)
+
+    # 2. All-black (H == 0) and uniform inputs across both tiled modes & clip limits
+    black = np.zeros((64, 64, 3), dtype=np.uint8)
+    for mode in ("tiled_ghe_gray", "tiled_ghe_lab"):
+        for clip_val in (0.0, 3.0):
+            out = ghe_mod.ghe_ensemble(
+                black, image_size=None, gaussian_sigma=1.0, window_size=32, method=mode, clip_limit=clip_val
+            )
+            assert out.shape == (64, 64, 3) and out.dtype == np.uint8
+            assert np.all(out == 0), f"All-black failed for {mode} clip={clip_val}"
+
+    # 3. Color image: tiled_ghe_gray produces 3 identical channels; tiled_ghe_lab preserves color differences
+    rng = np.random.default_rng(7)
+    color_img = np.zeros((64, 64, 3), dtype=np.uint8)
+    color_img[:, :, 2] = rng.integers(40, 200, size=(64, 64), dtype=np.uint8)  # strong red channel
+    color_img[:, :, 0] = rng.integers(5, 30, size=(64, 64), dtype=np.uint8)    # weak blue channel
+    color_img[:, :, 1] = rng.integers(10, 40, size=(64, 64), dtype=np.uint8)
+
+    out_gray = ghe_mod.ghe_ensemble(
+        color_img, image_size=None, gaussian_sigma=1.0, window_size=32, method="tiled_ghe_gray", clip_limit=3.0
+    )
+    assert out_gray.shape == (64, 64, 3) and out_gray.dtype == np.uint8
+    assert np.array_equal(out_gray[..., 0], out_gray[..., 1])
+    assert np.array_equal(out_gray[..., 0], out_gray[..., 2])
+
+    out_lab = ghe_mod.ghe_ensemble(
+        color_img, image_size=None, gaussian_sigma=1.0, window_size=32, method="tiled_ghe_lab", clip_limit=3.0
+    )
+    assert out_lab.shape == (64, 64, 3) and out_lab.dtype == np.uint8
+    assert float(out_lab[:, :, 2].mean()) > float(out_lab[:, :, 0].mean()) + 20.0
+
+    # 4. Verify RAM-optimized 3D fancy indexing matches explicit np.ix_ bilinear LUT interpolation bit-for-bit
+    gray_rand = rng.integers(0, 180, size=(64, 64), dtype=np.uint8)
+    win = 32
+    fast_out = ghe_mod.tiled_window_ghe(gray_rand, window_size=win, clip_limit=2.5, interpolate=True)
+
+    ny, nx = 2, 2
+    luts = np.empty((ny, nx, 256), dtype=np.uint8)
+    for i in range(ny):
+        for j in range(nx):
+            luts[i, j] = ghe_mod._tile_lut(gray_rand[i * win : (i + 1) * win, j * win : (j + 1) * win], clip_limit=2.5)
+    yy = np.arange(64, dtype=np.float64)
+    xx = np.arange(64, dtype=np.float64)
+    fy = np.clip((yy - win / 2.0) / win, 0.0, ny - 1)
+    fx = np.clip((xx - win / 2.0) / win, 0.0, nx - 1)
+    i0 = np.floor(fy).astype(int)
+    i1 = np.minimum(i0 + 1, ny - 1)
+    a = (fy - i0)[:, None]
+    j0 = np.floor(fx).astype(int)
+    j1 = np.minimum(j0 + 1, nx - 1)
+    b = (fx - j0)[None, :]
+    m00 = luts[np.ix_(i0, j0)][np.arange(64)[:, None], np.arange(64)[None, :], gray_rand]
+    m01 = luts[np.ix_(i0, j1)][np.arange(64)[:, None], np.arange(64)[None, :], gray_rand]
+    m10 = luts[np.ix_(i1, j0)][np.arange(64)[:, None], np.arange(64)[None, :], gray_rand]
+    m11 = luts[np.ix_(i1, j1)][np.arange(64)[:, None], np.arange(64)[None, :], gray_rand]
+    ref_out = np.rint((1 - a) * (1 - b) * m00 + (1 - a) * b * m01 + a * (1 - b) * m10 + a * b * m11).clip(0, 255).astype(np.uint8)
+    assert np.array_equal(fast_out, ref_out), "Low-RAM bilinear LUT lookup differs from np.ix_ reference"
+
+    # 5. Non-interpolated tiled mode returns valid uint8 array of identical shape
+    no_interp_out = ghe_mod.tiled_window_ghe(gray_rand, window_size=win, clip_limit=0.0, interpolate=False)
+    assert no_interp_out.shape == (64, 64) and no_interp_out.dtype == np.uint8

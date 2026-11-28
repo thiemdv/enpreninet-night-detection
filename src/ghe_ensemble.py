@@ -1,11 +1,16 @@
-"""F03: GHE Ensemble Preprocessor (15-Step Algorithm, Fig. 4).
+"""F03: GHE Ensemble Preprocessor (15-Step Algorithm, Fig. 4 & Tiled-Interpolated Modes).
 
-Implements the 15-step Gaussian + vectorized row-chunked sliding-window
-histogram equalization pipeline supporting three explicit gray-level
-transformation modes:
-  - fig4_literal       [PAPER]:   PDF(x) = f(x) / H,   s'(x) = clip(round(H * C(x)), 0, 255)
-  - fig4_normalized    [PROJECT]: PDF(x) = f(x) / W^2, s'(x) = round(H * C(x))
-  - standard_local_he  [PROJECT]: PDF(x) = f(x) / W^2, s'(x) = round(255 * C(x))
+Implements the 15-step Gaussian + local histogram equalization pipeline supporting
+five explicit modes:
+  - tiled_ghe_gray     [PROJECT/PAPER]: Normalized PDF = f(x) / N, s'(x) = round(H * C(x)),
+                                        W x W tile grid (default W=64, sigma=1.0) with bilinear
+                                        LUT interpolation across neighboring tiles & optional
+                                        clip_limit (CLAHE-like), stacked into (640, 640, 3).
+  - tiled_ghe_lab      [PROJECT]:       Color-preserving variant applying tiled GHE to the L
+                                        channel in CIE LAB space (preserves traffic-light color).
+  - fig4_literal       [PAPER]:         Sliding window PDF(x) = f(x) / H, s'(x) = clip(round(H * C(x)), 0, 255).
+  - fig4_normalized    [PROJECT]:       Sliding window PDF(x) = f(x) / W^2, s'(x) = round(H * C(x)).
+  - standard_local_he  [PROJECT]:       Sliding window PDF(x) = f(x) / W^2, s'(x) = round(255 * C(x)).
 
 Reads split manifests from <root>/splits/{train,val,test}.txt, cleans stale
 outputs under <root>/images/<method>/, writes lossless (640, 640, 3) PNG images,
@@ -13,8 +18,9 @@ records preprocessing metadata + preprocessing_fingerprint + timing in ghe_meta.
 and saves a visual comparison artifact under artifacts/<run_id>/.
 
 Usage:
-    python src/02_ghe_ensemble.py --config configs/config.yaml --dummy
-    python src/02_ghe_ensemble.py --config configs/config.yaml --run-id pilot --data-root /content/work/pilot_processed
+    python src/ghe_ensemble.py --config configs/config.yaml --dummy
+    python src/ghe_ensemble.py --config configs/config.yaml --run-id pilot --data-root /content/work/pilot_processed
+    python src/ghe_ensemble.py --config configs/config.yaml --run-id full --method tiled_ghe_lab --clip-limit 3.0
 """
 
 from __future__ import annotations
@@ -40,7 +46,10 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-VALID_METHODS = ("fig4_literal", "fig4_normalized", "standard_local_he")
+SLIDING_METHODS = ("fig4_literal", "fig4_normalized", "standard_local_he")
+TILED_METHODS = ("tiled_ghe_gray", "tiled_ghe_lab")
+VALID_METHODS = (*SLIDING_METHODS, *TILED_METHODS)
+
 CV2_BORDER_MAP = {
     "reflect": cv2.BORDER_REFLECT_101,
     "replicate": cv2.BORDER_REPLICATE,
@@ -92,7 +101,7 @@ def apply_gaussian_filter(
     kernel: np.ndarray,
     border_mode: str = "reflect",
 ) -> np.ndarray:
-    """Step 8: Convolve grayscale image with normalized Gaussian kernel."""
+    """Step 8: Convolve single-channel image with normalized Gaussian kernel."""
     if border_mode not in CV2_BORDER_MAP:
         raise ValueError(f"Unsupported border_mode: {border_mode!r}")
     filtered = cv2.filter2D(
@@ -104,6 +113,87 @@ def apply_gaussian_filter(
     return np.rint(np.clip(filtered, 0.0, 255.0)).astype(np.uint8)
 
 
+def _tile_lut(tile: np.ndarray, clip_limit: float = 0.0) -> np.ndarray:
+    """Steps 6-12 for a single tile: compute 256-entry LUT mapping [0, H] via round(H * CDF)."""
+    h_max = int(tile.max())
+    lut = np.arange(256, dtype=np.uint8)
+    if h_max == 0:
+        return lut
+
+    hist = np.bincount(tile.ravel(), minlength=h_max + 1)[: h_max + 1].astype(np.float64)
+    if clip_limit > 0.0:
+        limit = max(1.0, float(clip_limit) * float(tile.size) / float(h_max + 1))
+        excess = np.maximum(hist - limit, 0.0).sum()
+        hist = np.minimum(hist, limit) + excess / float(h_max + 1)
+
+    pdf = hist / hist.sum()
+    cdf = np.cumsum(pdf)
+    lut[: h_max + 1] = np.rint(float(h_max) * cdf).clip(0, 255).astype(np.uint8)
+    lut[h_max + 1 :] = h_max
+    return lut
+
+
+def tiled_window_ghe(
+    gray_gauss: np.ndarray,
+    window_size: int = 64,
+    clip_limit: float = 0.0,
+    interpolate: bool = True,
+) -> np.ndarray:
+    """Steps 9-15 (tiled): W x W grid histogram equalization with optional bilinear LUT interpolation."""
+    if window_size < 2:
+        raise ValueError(f"Tiled window_size must be >= 2, got {window_size}")
+    if clip_limit < 0.0:
+        raise ValueError(f"clip_limit must be >= 0, got {clip_limit}")
+
+    height, width = gray_gauss.shape
+    if not interpolate:
+        out = np.empty_like(gray_gauss)
+        for y in range(0, height, window_size):
+            for x in range(0, width, window_size):
+                y2 = min(y + window_size, height)
+                x2 = min(x + window_size, width)
+                tile = gray_gauss[y:y2, x:x2]
+                out[y:y2, x:x2] = _tile_lut(tile, clip_limit=clip_limit)[tile]
+        return out
+
+    ny = max(1, -(-height // window_size))
+    nx = max(1, -(-width // window_size))
+    luts = np.empty((ny, nx, 256), dtype=np.uint8)
+    for i in range(ny):
+        y = i * window_size
+        y2 = min(y + window_size, height)
+        for j in range(nx):
+            x = j * window_size
+            x2 = min(x + window_size, width)
+            luts[i, j] = _tile_lut(gray_gauss[y:y2, x:x2], clip_limit=clip_limit)
+
+    yy = np.arange(height, dtype=np.float64)
+    xx = np.arange(width, dtype=np.float64)
+    fy = np.clip((yy - window_size / 2.0) / float(window_size), 0.0, float(ny - 1))
+    fx = np.clip((xx - window_size / 2.0) / float(window_size), 0.0, float(nx - 1))
+    i0 = np.floor(fy).astype(np.intp)
+    i1 = np.minimum(i0 + 1, ny - 1)
+    a = (fy - i0)[:, None]
+    j0 = np.floor(fx).astype(np.intp)
+    j1 = np.minimum(j0 + 1, nx - 1)
+    b = (fx - j0)[None, :]
+
+    # Direct 3D fancy indexing avoids allocating four (H, W, 256) intermediate arrays (~416 MB/img -> ~1.6 MB/img)
+    v = gray_gauss
+    m00 = luts[i0[:, None], j0[None, :], v]
+    m01 = luts[i0[:, None], j1[None, :], v]
+    m10 = luts[i1[:, None], j0[None, :], v]
+    m11 = luts[i1[:, None], j1[None, :], v]
+
+    out = (
+        (1.0 - a) * (1.0 - b) * m00
+        + (1.0 - a) * b * m01
+        + a * (1.0 - b) * m10
+        + a * b * m11
+    )
+    return np.rint(out).clip(0, 255).astype(np.uint8)
+
+
 def sliding_window_ghe(
     gray_gauss: np.ndarray,
     window_size: int = 15,
@@ -113,13 +203,13 @@ def sliding_window_ghe(
     uniform_window_policy: str = "identity",
     chunk_rows: int = 32,
 ) -> np.ndarray:
-    """Steps 9-15 (core): Vectorized row-chunked W x W sliding-window histogram equalization."""
+    """Steps 9-15 (sliding): Vectorized row-chunked W x W sliding-window histogram equalization."""
     if window_size < 3 or window_size % 2 == 0:
         raise ValueError(f"window_size must be an odd integer >= 3, got {window_size}")
     if chunk_rows <= 0:
         raise ValueError(f"chunk_rows must be > 0, got {chunk_rows}")
-    if method not in VALID_METHODS:
-        raise ValueError(f"Unsupported method {method!r}; expected one of {VALID_METHODS}")
+    if method not in SLIDING_METHODS:
+        raise ValueError(f"Unsupported sliding method {method!r}; expected one of {SLIDING_METHODS}")
     if border_mode not in NP_PAD_MODE_MAP:
         raise ValueError(f"Unsupported border_mode: {border_mode!r}")
     if zero_division_policy not in {"identity", "zero"}:
@@ -185,22 +275,51 @@ def ghe_ensemble(
     zero_division_policy: str = "identity",
     uniform_window_policy: str = "identity",
     chunk_rows: int = 32,
+    clip_limit: float = 0.0,
+    interpolate: bool = True,
 ) -> np.ndarray:
-    """Full 15-step GHE Ensemble pipeline returning a (H, W, 3) uint8 image with identical channels."""
+    """Full 15-step GHE Ensemble pipeline returning a (H, W, 3) uint8 image."""
+    if method not in VALID_METHODS:
+        raise ValueError(f"Unsupported method {method!r}; expected one of {VALID_METHODS}")
+
     if image.ndim == 3:
         if image_size is not None and (image.shape[0] != image_size or image.shape[1] != image_size):
             image = cv2.resize(image, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        bgr = image
     elif image.ndim == 2:
         if image_size is not None and (image.shape[0] != image_size or image.shape[1] != image_size):
-            gray = cv2.resize(image, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+            gray_in = cv2.resize(image, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
         else:
-            gray = image.copy()
+            gray_in = image.copy()
+        bgr = np.stack([gray_in, gray_in, gray_in], axis=-1)
     else:
         raise ValueError(f"Expected 2D or 3D image array, got shape {image.shape}")
 
     kernel = build_gaussian_kernel(kernel_size=gaussian_kernel_size, sigma=gaussian_sigma)
+
+    if method == "tiled_ghe_lab":
+        lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+        l_gauss = apply_gaussian_filter(lab[:, :, 0], kernel=kernel, border_mode=border_mode)
+        lab[:, :, 0] = tiled_window_ghe(
+            l_gauss,
+            window_size=window_size,
+            clip_limit=clip_limit,
+            interpolate=interpolate,
+        )
+        return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else bgr[:, :, 0]
     gray_gauss = apply_gaussian_filter(gray, kernel=kernel, border_mode=border_mode)
+
+    if method == "tiled_ghe_gray":
+        equalized = tiled_window_ghe(
+            gray_gauss,
+            window_size=window_size,
+            clip_limit=clip_limit,
+            interpolate=interpolate,
+        )
+        return np.stack([equalized, equalized, equalized], axis=-1)
+
     equalized = sliding_window_ghe(
         gray_gauss=gray_gauss,
         window_size=window_size,
@@ -224,8 +343,11 @@ def save_comparison_artifact(
     zero_division_policy: str,
     uniform_window_policy: str,
     chunk_rows: int,
+    method: str = "tiled_ghe_gray",
+    clip_limit: float = 0.0,
+    interpolate: bool = True,
 ) -> None:
-    """Generate a 2x4 visual + histogram comparison across raw grayscale and all 3 GHE modes."""
+    """Generate a 2x4 visual + intensity histogram comparison artifact."""
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     resized = (
         cv2.resize(sample_img, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
@@ -234,39 +356,95 @@ def save_comparison_artifact(
     )
     raw_gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY) if resized.ndim == 3 else resized
 
-    panels: list[tuple[str, np.ndarray]] = [("Raw Grayscale", raw_gray)]
-    for mode in VALID_METHODS:
-        out_3ch = ghe_ensemble(
+    # Each entry: (title, display_img, hist_1d_source, is_rgb)
+    panels: list[tuple[str, np.ndarray, np.ndarray, bool]] = []
+    if method in TILED_METHODS:
+        raw_rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB) if resized.ndim == 3 else np.stack([raw_gray] * 3, axis=-1)
+        panels.append(("Raw Night Image", raw_rgb, raw_gray, True))
+
+        clip_alt = 3.0 if clip_limit <= 0.0 else clip_limit
+        gray_noclip = ghe_ensemble(
             resized,
             image_size=image_size,
             gaussian_kernel_size=gaussian_kernel_size,
             gaussian_sigma=gaussian_sigma,
             window_size=window_size,
-            method=mode,
+            method="tiled_ghe_gray",
             border_mode=border_mode,
-            zero_division_policy=zero_division_policy,
-            uniform_window_policy=uniform_window_policy,
-            chunk_rows=chunk_rows,
+            clip_limit=0.0,
+            interpolate=interpolate,
         )
-        panels.append((f"GHE ({mode})", out_3ch[..., 0]))
+        panels.append((f"tiled_ghe_gray (clip=0)", gray_noclip[..., 0], gray_noclip[..., 0], False))
+
+        gray_clip = ghe_ensemble(
+            resized,
+            image_size=image_size,
+            gaussian_kernel_size=gaussian_kernel_size,
+            gaussian_sigma=gaussian_sigma,
+            window_size=window_size,
+            method="tiled_ghe_gray",
+            border_mode=border_mode,
+            clip_limit=clip_alt,
+            interpolate=interpolate,
+        )
+        panels.append((f"tiled_ghe_gray (clip={clip_alt:g})", gray_clip[..., 0], gray_clip[..., 0], False))
+
+        lab_clip = ghe_ensemble(
+            resized,
+            image_size=image_size,
+            gaussian_kernel_size=gaussian_kernel_size,
+            gaussian_sigma=gaussian_sigma,
+            window_size=window_size,
+            method="tiled_ghe_lab",
+            border_mode=border_mode,
+            clip_limit=clip_alt,
+            interpolate=interpolate,
+        )
+        lab_rgb = cv2.cvtColor(lab_clip, cv2.COLOR_BGR2RGB)
+        lab_gray = cv2.cvtColor(lab_clip, cv2.COLOR_BGR2GRAY)
+        panels.append((f"tiled_ghe_lab (clip={clip_alt:g})", lab_rgb, lab_gray, True))
+        suptitle = (
+            f"EnPreNiNet Tiled GHE Comparison "
+            f"(W={window_size}, sigma={gaussian_sigma}, interp={interpolate}, border={border_mode})"
+        )
+    else:
+        panels.append(("Raw Grayscale", raw_gray, raw_gray, False))
+        for mode in SLIDING_METHODS:
+            out_3ch = ghe_ensemble(
+                resized,
+                image_size=image_size,
+                gaussian_kernel_size=gaussian_kernel_size,
+                gaussian_sigma=gaussian_sigma,
+                window_size=window_size,
+                method=mode,
+                border_mode=border_mode,
+                zero_division_policy=zero_division_policy,
+                uniform_window_policy=uniform_window_policy,
+                chunk_rows=chunk_rows,
+            )
+            panels.append((f"GHE ({mode})", out_3ch[..., 0], out_3ch[..., 0], False))
+        suptitle = (
+            f"EnPreNiNet Sliding GHE Comparison "
+            f"(W={window_size}, sigma={gaussian_sigma}, border={border_mode})"
+        )
 
     fig, axes = plt.subplots(2, 4, figsize=(16, 7), dpi=120)
-    for col, (title, img_2d) in enumerate(panels):
-        axes[0, col].imshow(img_2d, cmap="gray", vmin=0, vmax=255)
+    for col, (title, disp_img, hist_2d, is_rgb) in enumerate(panels):
+        if is_rgb:
+            axes[0, col].imshow(disp_img)
+        else:
+            axes[0, col].imshow(disp_img, cmap="gray", vmin=0, vmax=255)
         axes[0, col].set_title(title, fontsize=10)
         axes[0, col].axis("off")
 
-        axes[1, col].hist(img_2d.ravel(), bins=256, range=(0, 255), color="steelblue", alpha=0.85)
+        axes[1, col].hist(hist_2d.ravel(), bins=256, range=(0, 255), color="steelblue", alpha=0.85)
         axes[1, col].set_xlim(0, 255)
         axes[1, col].set_xlabel("Intensity")
         if col == 0:
             axes[1, col].set_ylabel("Pixel Count")
         axes[1, col].grid(alpha=0.25)
 
-    fig.suptitle(
-        f"EnPreNiNet GHE Ensemble Comparison (W={window_size}, sigma={gaussian_sigma}, border={border_mode})",
-        fontsize=12,
-    )
+    fig.suptitle(suptitle, fontsize=12)
     fig.tight_layout()
     fig.savefig(str(artifact_path), bbox_inches="tight")
     plt.close(fig)
@@ -295,6 +473,8 @@ def _process_single_ghe_task(task: tuple[Any, ...]) -> int:
         zero_division_policy,
         uniform_window_policy,
         chunk_rows,
+        clip_limit,
+        interpolate,
     ) = task
     img = cv2.imread(img_path_str, cv2.IMREAD_COLOR)
     if img is None:
@@ -310,6 +490,8 @@ def _process_single_ghe_task(task: tuple[Any, ...]) -> int:
         zero_division_policy=zero_division_policy,
         uniform_window_policy=uniform_window_policy,
         chunk_rows=chunk_rows,
+        clip_limit=clip_limit,
+        interpolate=interpolate,
     )
     if not cv2.imwrite(dst_path_str, ghe_img):
         raise IOError(f"cv2.imwrite failed for {dst_path_str}")
@@ -327,12 +509,16 @@ def process_dataset(
     chunk_rows: int,
     artifact_path: Path,
     workers: int = 1,
+    sigma: float | None = None,
+    clip_limit: float = 0.0,
+    interpolate: bool = True,
 ) -> dict[str, Any]:
     """Read split manifests from splits/*.txt, clean images/<method>/, and write GHE PNGs + ghe_meta.json."""
     ghe_cfg = cfg["preprocessing"]["ghe_ensemble"]
     image_size = int(ghe_cfg["image_size"])
     k_size = int(ghe_cfg["gaussian_kernel_size"])
-    sigma = float(ghe_cfg["gaussian_sigma"])
+    if sigma is None:
+        sigma = float(ghe_cfg["tiled_sigma"]) if method in TILED_METHODS else float(ghe_cfg["gaussian_sigma"])
     effective_workers = max(1, int(workers))
 
     splits_root = data_root / cfg["paths"]["splits_subdir"]
@@ -340,7 +526,7 @@ def process_dataset(
 
     if not splits_root.is_dir():
         raise FileNotFoundError(
-            f"Split manifests directory not found: {splits_root}. Run src/01_prepare_bdd.py first."
+            f"Split manifests directory not found: {splits_root}. Run src/prepare_bdd.py first."
         )
 
     if out_root.exists():
@@ -386,6 +572,8 @@ def process_dataset(
                     zero_division_policy,
                     uniform_window_policy,
                     chunk_rows,
+                    clip_limit,
+                    interpolate,
                 )
             )
 
@@ -393,7 +581,9 @@ def process_dataset(
             count = sum(_process_single_ghe_task(t) for t in tasks)
         else:
             with ProcessPoolExecutor(max_workers=effective_workers) as pool:
-                count = sum(pool.map(_process_single_ghe_task, tasks, chunksize=max(1, len(tasks) // (effective_workers * 4))))
+                count = sum(
+                    pool.map(_process_single_ghe_task, tasks, chunksize=max(1, len(tasks) // (effective_workers * 4)))
+                )
 
         total_images += count
         split_counts[split_name] = count
@@ -413,6 +603,9 @@ def process_dataset(
             zero_division_policy=zero_division_policy,
             uniform_window_policy=uniform_window_policy,
             chunk_rows=chunk_rows,
+            method=method,
+            clip_limit=clip_limit,
+            interpolate=interpolate,
         )
 
     preproc_params = {
@@ -425,6 +618,8 @@ def process_dataset(
         "border_mode": border_mode,
         "zero_division_policy": zero_division_policy,
         "uniform_window_policy": uniform_window_policy,
+        "clip_limit": clip_limit,
+        "interpolate": interpolate,
     }
     stats: dict[str, Any] = {
         **preproc_params,
@@ -448,11 +643,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dummy", action="store_true", help="Run on isolated data/dummy_processed")
     parser.add_argument("--run-id", type=str, default=None, help="Run namespace for artifacts (dummy, pilot, full)")
     parser.add_argument("--method", type=str, choices=VALID_METHODS, default=None, help="Override GHE mode")
-    parser.add_argument("--window-size", type=int, default=None, help="Override sliding window size W")
+    parser.add_argument("--sigma", type=float, default=None, help="Override Gaussian kernel sigma")
+    parser.add_argument("--window-size", type=int, default=None, help="Override window/tile size W")
+    parser.add_argument("--clip-limit", type=float, default=None, help="Override tiled GHE histogram clip_limit (>=0)")
+    interp_group = parser.add_mutually_exclusive_group()
+    interp_group.add_argument("--interpolate", dest="interpolate", action="store_true", help="Enable bilinear LUT interp")
+    interp_group.add_argument("--no-interpolate", dest="interpolate", action="store_false", help="Disable bilinear interp")
+    parser.set_defaults(interpolate=None)
     parser.add_argument("--border-mode", type=str, default=None, help="Override border padding mode")
     parser.add_argument("--zero-division-policy", type=str, default=None, help="Override H=0 policy")
     parser.add_argument("--uniform-window-policy", type=str, default=None, help="Override uniform window policy")
-    parser.add_argument("--chunk-rows", type=int, default=32, help="Number of rows per vectorized chunk")
+    parser.add_argument("--chunk-rows", type=int, default=32, help="Number of rows per vectorized sliding chunk")
     parser.add_argument(
         "--workers",
         type=int,
@@ -471,7 +672,21 @@ def main() -> None:
 
     run_id = args.run_id or ("dummy" if args.dummy else "full")
     method = args.method or str(ghe_cfg["method"])
-    window_size = args.window_size if args.window_size is not None else int(ghe_cfg["window_size"])
+    is_tiled = method in TILED_METHODS
+
+    if args.window_size is not None:
+        window_size = int(args.window_size)
+    else:
+        window_size = int(ghe_cfg["tiled_window_size"] if is_tiled else ghe_cfg["window_size"])
+
+    if args.sigma is not None:
+        sigma = float(args.sigma)
+    else:
+        sigma = float(ghe_cfg["tiled_sigma"] if is_tiled else ghe_cfg["gaussian_sigma"])
+
+    clip_limit = float(args.clip_limit) if args.clip_limit is not None else float(ghe_cfg.get("clip_limit", 0.0))
+    interpolate = bool(args.interpolate) if args.interpolate is not None else bool(ghe_cfg.get("interpolate", True))
+
     border_mode = args.border_mode or str(ghe_cfg["border_mode"])
     zero_div = args.zero_division_policy or str(ghe_cfg["zero_division_policy"])
     uniform_pol = args.uniform_window_policy or str(ghe_cfg["uniform_window_policy"])
@@ -498,8 +713,11 @@ def main() -> None:
         chunk_rows=args.chunk_rows,
         artifact_path=artifact_path,
         workers=workers,
+        sigma=sigma,
+        clip_limit=clip_limit,
+        interpolate=interpolate,
     )
-    print(f"[02_ghe_ensemble] Completed (run_id={run_id}, workers={workers})")
+    print(f"[ghe_ensemble] Completed (run_id={run_id}, method={method}, workers={workers})")
     print(json.dumps(stats, indent=2))
 
 

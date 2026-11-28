@@ -15,8 +15,8 @@ Features:
     which carries minor stochasticity from RPN/ROI proposal sampling.
 
 Usage:
-    python src/04_train_infer_frcnn.py --config configs/config.yaml --dummy --epochs 1 --device cpu
-    python src/04_train_infer_frcnn.py --config configs/config.yaml --run-id pilot --image-variant standard_local_he --device cuda
+    python src/train_infer_frcnn.py --config configs/config.yaml --dummy --epochs 1 --device cpu
+    python src/train_infer_frcnn.py --config configs/config.yaml --run-id pilot --image-variant tiled_ghe_gray --device cuda
 """
 
 from __future__ import annotations
@@ -36,7 +36,14 @@ from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-VALID_IMAGE_VARIANTS = ("raw", "fig4_literal", "fig4_normalized", "standard_local_he")
+VALID_IMAGE_VARIANTS = (
+    "raw",
+    "fig4_literal",
+    "fig4_normalized",
+    "standard_local_he",
+    "tiled_ghe_gray",
+    "tiled_ghe_lab",
+)
 
 
 def load_config(config_path: Path) -> dict[str, Any]:
@@ -94,7 +101,7 @@ def verify_ghe_metadata(
     ghe_meta_path = data_root / "images" / image_variant / "ghe_meta.json"
     if not ghe_meta_path.is_file():
         raise FileNotFoundError(
-            f"Missing GHE metadata file: {ghe_meta_path}. Re-run src/02_ghe_ensemble.py for '{image_variant}'."
+            f"Missing GHE metadata file: {ghe_meta_path}. Re-run src/ghe_ensemble.py for '{image_variant}'."
         )
     ghe_meta = json.loads(ghe_meta_path.read_text(encoding="utf-8"))
     ghe_fp = ghe_meta.get("dataset_fingerprint")
@@ -106,7 +113,7 @@ def verify_ghe_metadata(
         raise ValueError(
             f"Stale GHE images detected for '{image_variant}': "
             f"ghe_meta.dataset_fingerprint={ghe_fp} != coco.dataset_fingerprint={expected_dataset_fp}. "
-            f"Re-run src/02_ghe_ensemble.py before training."
+            f"Re-run src/ghe_ensemble.py before training."
         )
     return ghe_meta
 
@@ -491,7 +498,7 @@ def train_and_infer_frcnn(
             best_ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
             best_state_dict_cpu = best_ckpt["model_state_dict"]
         print(
-            f"[04_train_infer_frcnn] Resumed from {last_ckpt_path} "
+            f"[train_infer_frcnn] Resumed from {last_ckpt_path} "
             f"(completed_epochs={start_epoch}/{epochs}, best_val_loss={best_val_loss})"
         )
 
@@ -529,7 +536,7 @@ def train_and_infer_frcnn(
         if val_loader is not None:
             val_loss = _compute_validation_loss(model, val_loader, device, use_amp=use_amp)
             print(
-                f"[04_train_infer_frcnn] Epoch {epoch_idx + 1}/{total_epochs} (amp={use_amp}) "
+                f"[train_infer_frcnn] Epoch {epoch_idx + 1}/{total_epochs} (amp={use_amp}) "
                 f"train_loss={float(np.mean(epoch_losses)):.4f} val_loss={val_loss:.4f}"
             )
             if best_val_loss is None or val_loss < best_val_loss:
@@ -655,7 +662,7 @@ def main() -> None:
         "num_eval_images": len(preds),
         "total_detections": sum(int(v["boxes"].shape[0]) for v in preds.values()),
     }
-    print("[04_train_infer_frcnn] Completed")
+    print("[train_infer_frcnn] Completed")
     print(json.dumps(summary, indent=2))
 
 

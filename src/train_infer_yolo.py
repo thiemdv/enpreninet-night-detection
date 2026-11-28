@@ -16,8 +16,8 @@ YOLO dataset views, and validates `ghe_meta.json["dataset_fingerprint"]` before
 training/inferring on any GHE variant.
 
 Usage:
-    python src/03_train_infer_yolo.py --config configs/config.yaml --dummy --epochs 1 --device cpu
-    python src/03_train_infer_yolo.py --config configs/config.yaml --run-id pilot --yolo-repo /content/yolov5 --work-dir /content/work/yolo_views/pilot --image-variant standard_local_he
+    python src/train_infer_yolo.py --config configs/config.yaml --dummy --epochs 1 --device cpu
+    python src/train_infer_yolo.py --config configs/config.yaml --run-id pilot --yolo-repo /content/yolov5 --work-dir /content/work/yolo_views/pilot --image-variant tiled_ghe_gray
 """
 
 from __future__ import annotations
@@ -38,7 +38,14 @@ import torch.nn as nn
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-VALID_IMAGE_VARIANTS = ("raw", "fig4_literal", "fig4_normalized", "standard_local_he")
+VALID_IMAGE_VARIANTS = (
+    "raw",
+    "fig4_literal",
+    "fig4_normalized",
+    "standard_local_he",
+    "tiled_ghe_gray",
+    "tiled_ghe_lab",
+)
 
 
 def load_config(config_path: Path) -> dict[str, Any]:
@@ -105,7 +112,7 @@ def verify_ghe_metadata(
     ghe_meta_path = data_root / "images" / image_variant / "ghe_meta.json"
     if not ghe_meta_path.is_file():
         raise FileNotFoundError(
-            f"Missing GHE metadata file: {ghe_meta_path}. Re-run src/02_ghe_ensemble.py for '{image_variant}'."
+            f"Missing GHE metadata file: {ghe_meta_path}. Re-run src/ghe_ensemble.py for '{image_variant}'."
         )
     ghe_meta = json.loads(ghe_meta_path.read_text(encoding="utf-8"))
     ghe_fp = ghe_meta.get("dataset_fingerprint")
@@ -117,7 +124,7 @@ def verify_ghe_metadata(
         raise ValueError(
             f"Stale GHE images detected for '{image_variant}': "
             f"ghe_meta.dataset_fingerprint={ghe_fp} != coco.dataset_fingerprint={expected_dataset_fp}. "
-            f"Re-run src/02_ghe_ensemble.py before training."
+            f"Re-run src/ghe_ensemble.py before training."
         )
     return ghe_meta
 
@@ -660,7 +667,7 @@ def main() -> None:
         "num_eval_images": len(preds),
         "total_detections": sum(int(v["boxes"].shape[0]) for v in preds.values()),
     }
-    print("[03_train_infer_yolo] Completed")
+    print("[train_infer_yolo] Completed")
     print(json.dumps(summary, indent=2))
 
 

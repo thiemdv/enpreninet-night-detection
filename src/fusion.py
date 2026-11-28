@@ -9,8 +9,8 @@ Merges unified predictions from YOLOv5l (Branch 1) and Faster R-CNN ResNet-152
   4. Collision-free confidence snapshot filenames + companion `.meta.json` for every `.pt`.
 
 Usage:
-    python src/05_fusion.py --config configs/config.yaml --dummy --device cpu
-    python src/05_fusion.py --config configs/config.yaml --run-id pilot --global-nms --device cuda
+    python src/fusion.py --config configs/config.yaml --dummy --device cpu
+    python src/fusion.py --config configs/config.yaml --run-id pilot --global-nms --device cuda
 """
 
 from __future__ import annotations
@@ -25,7 +25,14 @@ from torchvision.ops import batched_nms
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-VALID_IMAGE_VARIANTS = ("raw", "fig4_literal", "fig4_normalized", "standard_local_he")
+VALID_IMAGE_VARIANTS = (
+    "raw",
+    "fig4_literal",
+    "fig4_normalized",
+    "standard_local_he",
+    "tiled_ghe_gray",
+    "tiled_ghe_lab",
+)
 
 
 def load_config(config_path: Path) -> dict[str, Any]:
@@ -401,7 +408,7 @@ def main() -> None:
         "thresholded_detection_counts": tau_counts,
         "output": str(output_path),
     }
-    print("[05_fusion] Completed")
+    print("[fusion] Completed")
     print(json.dumps(summary, indent=2))
 
 
