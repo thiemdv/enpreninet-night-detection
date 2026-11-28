@@ -20,8 +20,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 import hashlib
 import json
+import os
 import shutil
 import time
 from pathlib import Path
@@ -279,6 +281,41 @@ def _read_dataset_fingerprint(data_root: Path) -> str | None:
     return str(fp) if fp else None
 
 
+def _process_single_ghe_task(task: tuple[Any, ...]) -> int:
+    """Picklable worker function for multiprocessing GHE preprocessing."""
+    (
+        img_path_str,
+        dst_path_str,
+        image_size,
+        k_size,
+        sigma,
+        window_size,
+        method,
+        border_mode,
+        zero_division_policy,
+        uniform_window_policy,
+        chunk_rows,
+    ) = task
+    img = cv2.imread(img_path_str, cv2.IMREAD_COLOR)
+    if img is None:
+        raise RuntimeError(f"Failed to read image: {img_path_str}")
+    ghe_img = ghe_ensemble(
+        img,
+        image_size=image_size,
+        gaussian_kernel_size=k_size,
+        gaussian_sigma=sigma,
+        window_size=window_size,
+        method=method,
+        border_mode=border_mode,
+        zero_division_policy=zero_division_policy,
+        uniform_window_policy=uniform_window_policy,
+        chunk_rows=chunk_rows,
+    )
+    if not cv2.imwrite(dst_path_str, ghe_img):
+        raise IOError(f"cv2.imwrite failed for {dst_path_str}")
+    return 1
+
+
 def process_dataset(
     cfg: dict[str, Any],
     data_root: Path,
@@ -289,12 +326,14 @@ def process_dataset(
     uniform_window_policy: str,
     chunk_rows: int,
     artifact_path: Path,
+    workers: int = 1,
 ) -> dict[str, Any]:
     """Read split manifests from splits/*.txt, clean images/<method>/, and write GHE PNGs + ghe_meta.json."""
     ghe_cfg = cfg["preprocessing"]["ghe_ensemble"]
     image_size = int(ghe_cfg["image_size"])
     k_size = int(ghe_cfg["gaussian_kernel_size"])
     sigma = float(ghe_cfg["gaussian_sigma"])
+    effective_workers = max(1, int(workers))
 
     splits_root = data_root / cfg["paths"]["splits_subdir"]
     out_root = data_root / cfg["paths"]["ghe_images_root"] / method
@@ -325,33 +364,38 @@ def process_dataset(
         manifest_entries = [
             ln.strip() for ln in manifest_path.read_text(encoding="utf-8").splitlines() if ln.strip()
         ]
-        count = 0
+        tasks: list[tuple[Any, ...]] = []
         for rel_path in manifest_entries:
             img_path = data_root / Path(rel_path)
-            img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
-            if img is None:
-                raise RuntimeError(f"Failed to read image listed in {manifest_path}: {img_path}")
             if sample_img is None:
-                sample_img = img
-
-            ghe_img = ghe_ensemble(
-                img,
-                image_size=image_size,
-                gaussian_kernel_size=k_size,
-                gaussian_sigma=sigma,
-                window_size=window_size,
-                method=method,
-                border_mode=border_mode,
-                zero_division_policy=zero_division_policy,
-                uniform_window_policy=uniform_window_policy,
-                chunk_rows=chunk_rows,
-            )
+                first_img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+                if first_img is None:
+                    raise RuntimeError(f"Failed to read image listed in {manifest_path}: {img_path}")
+                sample_img = first_img
             dst_path = split_out / f"{img_path.stem}.png"
-            if not cv2.imwrite(str(dst_path), ghe_img):
-                raise IOError(f"cv2.imwrite failed for {dst_path}")
-            count += 1
-            total_images += 1
+            tasks.append(
+                (
+                    str(img_path),
+                    str(dst_path),
+                    image_size,
+                    k_size,
+                    sigma,
+                    window_size,
+                    method,
+                    border_mode,
+                    zero_division_policy,
+                    uniform_window_policy,
+                    chunk_rows,
+                )
+            )
 
+        if effective_workers == 1 or len(tasks) <= 1:
+            count = sum(_process_single_ghe_task(t) for t in tasks)
+        else:
+            with ProcessPoolExecutor(max_workers=effective_workers) as pool:
+                count = sum(pool.map(_process_single_ghe_task, tasks, chunksize=max(1, len(tasks) // (effective_workers * 4))))
+
+        total_images += count
         split_counts[split_name] = count
 
     elapsed_sec = time.perf_counter() - t0
@@ -386,6 +430,7 @@ def process_dataset(
         **preproc_params,
         "preprocessing_fingerprint": compute_preprocessing_fingerprint(preproc_params),
         "chunk_rows": chunk_rows,
+        "workers": effective_workers,
         "total_images": total_images,
         "elapsed_seconds": round(elapsed_sec, 4),
         "ms_per_image": round(ms_per_image, 2),
@@ -408,6 +453,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--zero-division-policy", type=str, default=None, help="Override H=0 policy")
     parser.add_argument("--uniform-window-policy", type=str, default=None, help="Override uniform window policy")
     parser.add_argument("--chunk-rows", type=int, default=32, help="Number of rows per vectorized chunk")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Parallel CPU worker processes (0=auto: 1 in dummy, min(cpu_count, 8) in real mode)",
+    )
     parser.add_argument("--data-root", type=Path, default=None, help="Override processed data root directory")
     return parser.parse_args()
 
@@ -425,6 +476,13 @@ def main() -> None:
     zero_div = args.zero_division_policy or str(ghe_cfg["zero_division_policy"])
     uniform_pol = args.uniform_window_policy or str(ghe_cfg["uniform_window_policy"])
 
+    if args.workers > 0:
+        workers = args.workers
+    elif args.dummy:
+        workers = 1
+    else:
+        workers = max(1, min(os.cpu_count() or 1, 8))
+
     default_root = resolve_path(cfg["paths"]["data_dummy_processed"] if args.dummy else cfg["paths"]["data_processed"])
     data_root = args.data_root or default_root
     artifact_path = resolve_ghe_artifact_path(cfg, run_id=run_id, method=method)
@@ -439,8 +497,9 @@ def main() -> None:
         uniform_window_policy=uniform_pol,
         chunk_rows=args.chunk_rows,
         artifact_path=artifact_path,
+        workers=workers,
     )
-    print(f"[02_ghe_ensemble] Completed (run_id={run_id})")
+    print(f"[02_ghe_ensemble] Completed (run_id={run_id}, workers={workers})")
     print(json.dumps(stats, indent=2))
 
 

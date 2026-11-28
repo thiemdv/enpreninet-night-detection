@@ -314,16 +314,18 @@ def _compute_validation_loss(
     model: FasterRCNN,
     val_loader: DataLoader,
     device: torch.device,
+    use_amp: bool = False,
 ) -> float:
     """Compute average validation loss (torchvision FasterRCNN returns loss dict in train() under no_grad)."""
     model.train()
     losses: list[float] = []
     with torch.no_grad():
         for images, targets in val_loader:
-            images = [img.to(device) for img in images]
-            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-            loss_dict = model(images, targets)
-            loss = sum(loss_dict.values())
+            images = [img.to(device, non_blocking=True) for img in images]
+            targets = [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                loss_dict = model(images, targets)
+                loss = sum(loss_dict.values())
             if not torch.isfinite(loss):
                 raise RuntimeError(f"Non-finite validation loss detected: {loss.item()}")
             losses.append(float(loss.detach().cpu().item()))
@@ -341,8 +343,11 @@ def train_and_infer_frcnn(
     device: torch.device,
     score_floor: float,
     dummy: bool,
+    amp: bool | None = None,
+    resume: bool = False,
+    num_workers: int | None = None,
 ) -> tuple[Path, Path, float, float | None]:
-    """Train Faster R-CNN ResNet-152 with CPU-offloaded immediate best checkpointing, then export predictions."""
+    """Train Faster R-CNN ResNet-152 with CUDA AMP fp16, resumable checkpoints, and immediate best saving."""
     seed = int(cfg["project"]["seed"])
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -373,7 +378,16 @@ def train_and_infer_frcnn(
     ghe_meta = verify_ghe_metadata(data_root, image_variant, eval_ds.dataset_fingerprint)
 
     effective_bs = 1 if dummy else batch_size
-    train_loader = DataLoader(train_ds, batch_size=effective_bs, shuffle=not dummy, collate_fn=collate_fn)
+    loader_workers = 0 if (dummy or device.type != "cuda") else (num_workers if num_workers is not None else 2)
+    pin_mem = device.type == "cuda" and not dummy
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=effective_bs,
+        shuffle=not dummy,
+        num_workers=loader_workers,
+        pin_memory=pin_mem,
+        collate_fn=collate_fn,
+    )
 
     val_loader: DataLoader | None = None
     val_coco_path = coco_dir / "instances_val.json"
@@ -387,10 +401,19 @@ def train_and_infer_frcnn(
             num_target_classes=num_target_classes,
         )
         if len(val_ds) > 0:
-            val_loader = DataLoader(val_ds, batch_size=effective_bs, shuffle=False, collate_fn=collate_fn)
+            val_loader = DataLoader(
+                val_ds,
+                batch_size=effective_bs,
+                shuffle=False,
+                num_workers=loader_workers,
+                pin_memory=pin_mem,
+                collate_fn=collate_fn,
+            )
 
     use_pretrained = False if dummy else bool(frcnn_cfg["pretrained"])
     trainable_layers = 5 if not use_pretrained else 3
+    use_amp = (device.type == "cuda") and (not dummy) and (True if amp is None else bool(amp))
+
     model = build_faster_rcnn_model(
         backbone_name=str(frcnn_cfg["backbone"]),
         num_classes=num_classes,
@@ -408,54 +431,92 @@ def train_and_infer_frcnn(
         momentum=float(frcnn_cfg["momentum"]),
         weight_decay=float(frcnn_cfg["weight_decay"]),
     )
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     run_dir, ckpt_path, preds_path = resolve_frcnn_output_paths(
         cfg, run_id=run_id, image_variant=image_variant, eval_split=eval_split, dummy=dummy
     )
     run_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    last_ckpt_path = run_dir / f"frcnn_resnet152_last_{image_variant}.pth"
 
-    def _save_checkpoint(state_dict_cpu: dict[str, torch.Tensor], best_vl: float | None, epoch_num: int) -> None:
-        torch.save(
-            {
-                "model_state_dict": state_dict_cpu,
-                "backbone": str(frcnn_cfg["backbone"]),
-                "num_classes": num_classes,
-                "img_size": img_size,
-                "run_id": run_id,
-                "image_variant": image_variant,
-                "trainable_backbone_layers": trainable_layers,
-                "epoch": epoch_num,
-                "best_val_loss": best_vl,
-                "dataset_fingerprint": eval_ds.dataset_fingerprint,
-                "preprocessing_fingerprint": (ghe_meta or {}).get("preprocessing_fingerprint"),
-                "dummy": dummy,
-            },
-            ckpt_path,
-        )
+    def _save_checkpoint(
+        target_path: Path,
+        state_dict_cpu: dict[str, torch.Tensor],
+        best_vl: float | None,
+        epoch_num: int,
+        include_optimizer: bool = False,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "model_state_dict": state_dict_cpu,
+            "backbone": str(frcnn_cfg["backbone"]),
+            "num_classes": num_classes,
+            "img_size": img_size,
+            "run_id": run_id,
+            "image_variant": image_variant,
+            "trainable_backbone_layers": trainable_layers,
+            "amp": use_amp,
+            "epoch": epoch_num,
+            "best_val_loss": best_vl,
+            "dataset_fingerprint": eval_ds.dataset_fingerprint,
+            "preprocessing_fingerprint": (ghe_meta or {}).get("preprocessing_fingerprint"),
+            "dummy": dummy,
+        }
+        if include_optimizer:
+            payload["optimizer_state_dict"] = optimizer.state_dict()
+            payload["scaler_state_dict"] = scaler.state_dict()
+        torch.save(payload, target_path)
 
+    start_epoch = 0
     last_loss = 0.0
     best_val_loss: float | None = None
     best_state_dict_cpu: dict[str, torch.Tensor] | None = None
 
-    for epoch_idx in range(max(1, epochs)):
+    if resume and last_ckpt_path.is_file():
+        resume_ckpt = torch.load(last_ckpt_path, map_location="cpu", weights_only=False)
+        saved_fp = resume_ckpt.get("dataset_fingerprint")
+        if eval_ds.dataset_fingerprint and saved_fp and str(saved_fp) != str(eval_ds.dataset_fingerprint):
+            raise ValueError(
+                f"Cannot --resume from {last_ckpt_path}: dataset_fingerprint mismatch "
+                f"(ckpt={saved_fp} != current={eval_ds.dataset_fingerprint})."
+            )
+        model.load_state_dict(resume_ckpt["model_state_dict"])
+        if "optimizer_state_dict" in resume_ckpt:
+            optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
+        if "scaler_state_dict" in resume_ckpt and use_amp:
+            scaler.load_state_dict(resume_ckpt["scaler_state_dict"])
+        start_epoch = int(resume_ckpt.get("epoch", 0))
+        best_val_loss = resume_ckpt.get("best_val_loss")
+        if ckpt_path.is_file():
+            best_ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            best_state_dict_cpu = best_ckpt["model_state_dict"]
+        print(
+            f"[04_train_infer_frcnn] Resumed from {last_ckpt_path} "
+            f"(completed_epochs={start_epoch}/{epochs}, best_val_loss={best_val_loss})"
+        )
+
+    total_epochs = max(1, epochs)
+    for epoch_idx in range(start_epoch, total_epochs):
         model.train()
         epoch_losses: list[float] = []
         for step_idx, (images, targets) in enumerate(train_loader):
-            images = [img.to(device) for img in images]
-            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+            images = [img.to(device, non_blocking=True) for img in images]
+            targets = [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
 
-            loss_dict = model(images, targets)
-            loss = sum(loss_dict.values())
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                loss_dict = model(images, targets)
+                loss = sum(loss_dict.values())
             if not torch.isfinite(loss):
                 raise RuntimeError(
                     f"Non-finite training loss detected at epoch={epoch_idx + 1}, step={step_idx}: {loss.item()}"
                 )
 
-            optimizer.zero_grad()
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(params, max_norm=10.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             loss_val = float(loss.detach().cpu().item())
             epoch_losses.append(loss_val)
@@ -464,22 +525,26 @@ def train_and_infer_frcnn(
             if dummy and step_idx >= 0:
                 break  # 1 batch/step offline smoke test
 
+        current_state_cpu = _cpu_state_dict(model)
         if val_loader is not None:
-            val_loss = _compute_validation_loss(model, val_loader, device)
+            val_loss = _compute_validation_loss(model, val_loader, device, use_amp=use_amp)
             print(
-                f"[04_train_infer_frcnn] Epoch {epoch_idx + 1}/{epochs} "
+                f"[04_train_infer_frcnn] Epoch {epoch_idx + 1}/{total_epochs} (amp={use_amp}) "
                 f"train_loss={float(np.mean(epoch_losses)):.4f} val_loss={val_loss:.4f}"
             )
             if best_val_loss is None or val_loss < best_val_loss:
                 best_val_loss = val_loss
-                best_state_dict_cpu = _cpu_state_dict(model)
-                # A04 fix: persist best checkpoint immediately to disk/Drive on improvement
-                _save_checkpoint(best_state_dict_cpu, best_val_loss, epoch_idx + 1)
+                best_state_dict_cpu = current_state_cpu
+                _save_checkpoint(ckpt_path, best_state_dict_cpu, best_val_loss, epoch_idx + 1, include_optimizer=False)
 
+        if not dummy:
+            _save_checkpoint(last_ckpt_path, current_state_cpu, best_val_loss, epoch_idx + 1, include_optimizer=True)
+
+    # R3-04 fix: load CPU state dict directly into GPU model without duplicating VRAM
     if best_state_dict_cpu is not None:
-        model.load_state_dict({k: v.to(device) for k, v in best_state_dict_cpu.items()})
-    else:
-        _save_checkpoint(_cpu_state_dict(model), best_val_loss, max(1, epochs))
+        model.load_state_dict(best_state_dict_cpu)
+    elif not ckpt_path.is_file():
+        _save_checkpoint(ckpt_path, _cpu_state_dict(model), best_val_loss, total_epochs, include_optimizer=False)
 
     model.eval()
     preds_by_image: dict[int, dict[str, torch.Tensor]] = {}
@@ -487,7 +552,8 @@ def train_and_infer_frcnn(
         for idx in range(len(eval_ds)):
             img_tensor, target = eval_ds[idx]
             img_id = int(target["image_id"].item())
-            raw_out = model([img_tensor.to(device)])[0]
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                raw_out = model([img_tensor.to(device)])[0]
             preds_by_image[img_id] = decode_frcnn_predictions(
                 raw_output=raw_out,
                 img_size=img_size,
@@ -505,6 +571,7 @@ def train_and_infer_frcnn(
             "eval_split": eval_split,
             "score_floor": score_floor,
             "seed": seed,
+            "amp": use_amp,
             "pretrained_backbone": use_pretrained,
             "trainable_backbone_layers": trainable_layers,
             "best_val_loss": best_val_loss,
@@ -534,6 +601,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--score-floor", type=float, default=0.001, help="Minimum confidence score kept before fusion")
     parser.add_argument("--eval-split", type=str, choices=("val", "test"), default="test", help="Split to infer on")
     parser.add_argument("--data-root", type=Path, default=None, help="Override processed data root directory")
+    amp_group = parser.add_mutually_exclusive_group()
+    amp_group.add_argument("--amp", dest="amp", action="store_true", help="Enable CUDA AMP fp16 (default on CUDA)")
+    amp_group.add_argument("--no-amp", dest="amp", action="store_false", help="Disable CUDA AMP fp16")
+    parser.set_defaults(amp=None)
+    parser.add_argument("--resume", action="store_true", default=False, help="Resume training from last.pth checkpoint")
+    parser.add_argument("--num-workers", type=int, default=None, help="DataLoader worker processes (default 2 on CUDA)")
     parser.add_argument("--dummy", action="store_true", help="Run offline CPU smoke test (weights=None, 1 batch/step)")
     return parser.parse_args()
 
@@ -562,6 +635,9 @@ def main() -> None:
         device=device,
         score_floor=args.score_floor,
         dummy=args.dummy,
+        amp=args.amp,
+        resume=args.resume,
+        num_workers=args.num_workers,
     )
 
     preds = torch.load(preds_path, weights_only=True)
