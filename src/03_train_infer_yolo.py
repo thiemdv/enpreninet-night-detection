@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -451,6 +452,9 @@ def run_real_yolo(
     if train_out_dir.exists():
         shutil.rmtree(train_out_dir)
 
+    # A07 fix: PyTorch 2.6+ defaults torch.load(weights_only=True), which blocks legacy YOLOv5 v7.0 checkpoints
+    yolo_env = {**os.environ, "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD": "1"}
+
     train_cmd = [
         sys.executable,
         str(train_py),
@@ -474,7 +478,7 @@ def run_real_yolo(
         "--device",
         device_str,
     ]
-    subprocess.run(train_cmd, check=True)
+    subprocess.run(train_cmd, check=True, env=yolo_env)
 
     best_pt = run_dir / "train" / "weights" / "best.pt"
     if best_pt.is_file():
@@ -511,7 +515,7 @@ def run_real_yolo(
         "--device",
         device_str,
     ]
-    subprocess.run(detect_cmd, check=True)
+    subprocess.run(detect_cmd, check=True, env=yolo_env)
 
     labels_out_dir = infer_dir / "labels"
     preds_by_image: dict[int, dict[str, torch.Tensor]] = {}
