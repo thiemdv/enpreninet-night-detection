@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import random
 import shutil
 from pathlib import Path
@@ -212,8 +213,31 @@ def generate_dummy_bdd_dataset(dummy_dir: Path, seed: int = 42) -> Path:
     return labels_path
 
 
-def find_image_file(raw_dir: Path, image_name: str) -> Path:
-    """Locate an image inside raw_dir across standard BDD100K unzipped layouts."""
+def build_image_index(raw_dir: Path) -> dict[str, Path]:
+    """Recursively index image filenames under raw_dir once for O(1) lookup (handles trainA/trainB/testA/testB)."""
+    index: dict[str, Path] = {}
+    search_roots = []
+    for sub in (raw_dir / "images" / "100k", raw_dir / "bdd100k" / "images" / "100k"):
+        if sub.is_dir():
+            search_roots.append(sub)
+    if not search_roots:
+        search_roots = [raw_dir]
+
+    valid_exts = {".jpg", ".jpeg", ".png"}
+    for root_dir in search_roots:
+        for dirpath, _dirnames, filenames in os.walk(root_dir):
+            dp = Path(dirpath)
+            for fname in filenames:
+                if Path(fname).suffix.lower() in valid_exts and fname not in index:
+                    index[fname] = dp / fname
+    return index
+
+
+def find_image_file(raw_dir: Path, image_name: str, image_index: dict[str, Path] | None = None) -> Path:
+    """Locate an image inside raw_dir using prebuilt recursive index or standard BDD100K paths."""
+    if image_index is not None and image_name in image_index:
+        return image_index[image_name]
+
     candidates = [
         raw_dir / "images" / image_name,
         raw_dir / image_name,
@@ -333,6 +357,7 @@ def prepare_bdd_dataset(
 
     (out_dir / splits_subdir).mkdir(parents=True, exist_ok=True)
     (out_dir / coco_subdir).mkdir(parents=True, exist_ok=True)
+    image_index = build_image_index(raw_dir)
 
     for split_name in ("train", "val", "test"):
         split_items = split_map[split_name]
@@ -346,7 +371,7 @@ def prepare_bdd_dataset(
 
         for frame in split_items:
             img_name = frame["name"]
-            src_img_path = find_image_file(raw_dir, img_name)
+            src_img_path = find_image_file(raw_dir, img_name, image_index=image_index)
             img = cv2.imread(str(src_img_path), cv2.IMREAD_COLOR)
             if img is None:
                 raise RuntimeError(f"Failed to read image: {src_img_path}")
